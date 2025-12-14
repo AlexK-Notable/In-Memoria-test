@@ -30,12 +30,9 @@ export type ProgressCallback = (current: number, total: number, message: string)
  * Result from semantic similarity search
  */
 export interface SemanticSearchResult {
-  conceptId: string;
-  conceptName: string;
-  conceptType: string;
+  concept: string;
   similarity: number;
   filePath: string;
-  lineRange: { start: number; end: number };
 }
 
 /**
@@ -44,7 +41,7 @@ export interface SemanticSearchResult {
 export interface EntryPoint {
   type: string;
   filePath: string;
-  description: string;
+  framework?: string;
 }
 
 /**
@@ -52,8 +49,8 @@ export interface EntryPoint {
  */
 export interface KeyDirectory {
   path: string;
-  purpose: string;
-  importance: 'high' | 'medium' | 'low';
+  type: string;
+  fileCount: number;
 }
 
 /**
@@ -63,8 +60,8 @@ export interface ApproachPrediction {
   approach: string;
   confidence: number;
   reasoning: string;
-  suggestedPatterns: string[];
-  estimatedComplexity: 'low' | 'medium' | 'high';
+  patterns: string[];
+  complexity: 'low' | 'medium' | 'high';
 }
 
 /**
@@ -73,9 +70,10 @@ export interface ApproachPrediction {
 export interface FileRouting {
   intendedFeature: string;
   targetFiles: string[];
-  workType: string;
+  workType: 'feature' | 'bugfix' | 'refactor' | 'test';
   suggestedStartPoint: string;
   confidence: number;
+  reasoning: string;
 }
 
 /**
@@ -102,15 +100,39 @@ export interface CodebaseAnalysisResult {
     confidence: number;
   }>;
   complexity: {
-    cyclomatic?: number;
-    cognitive?: number;
+    cyclomatic: number;
+    cognitive: number;
+    lines: number;
   };
+  analysisStatus?: 'normal' | 'degraded';
+  errors?: string[];
+  entryPoints?: Array<{
+    type: string;
+    filePath: string;
+    framework?: string;
+  }>;
+  keyDirectories?: Array<{
+    path: string;
+    type: string;
+    fileCount: number;
+  }>;
 }
 
 /**
- * Concept extracted from analysis
+ * Concept extracted from file analysis
  */
 export interface AnalyzedConcept {
+  name: string;
+  type: string;
+  confidence: number;
+  filePath: string;
+  lineRange: { start: number; end: number };
+}
+
+/**
+ * Concept learned from codebase (includes id and relationships)
+ */
+export interface LearnedConcept {
   id: string;
   name: string;
   type: string;
@@ -122,14 +144,16 @@ export interface AnalyzedConcept {
 
 /**
  * Pattern extracted from analysis
+ * Note: frequency, contexts, examples are optional as file-level analysis
+ * may not include these (they are populated at codebase level)
  */
 export interface AnalyzedPattern {
   type: string;
   description: string;
   confidence: number;
-  frequency: number;
-  contexts: string[];
-  examples: string[];
+  frequency?: number;
+  contexts?: string[];
+  examples?: string[];
 }
 
 /**
@@ -139,27 +163,43 @@ export interface PatternExtractionResult {
   type: string;
   description: string;
   frequency: number;
-  confidence: number;
 }
 
 /**
  * Relevant pattern for a given problem
  */
 export interface RelevantPattern {
-  pattern: string;
-  description: string;
+  patternId: string;
+  patternType: string;
+  patternContent: Record<string, unknown>;
+  frequency: number;
+  contexts: string[];
+  examples: Array<{ code: string }>;
   confidence: number;
-  examples: string[];
-  reasoning: string;
 }
 
 /**
  * Feature map result
  */
 export interface FeatureMapResult {
+  id: string;
   featureName: string;
-  files: string[];
+  primaryFiles: string[];
+  relatedFiles: string[];
+  dependencies: string[];
+}
+
+/**
+ * Pattern learned from codebase analysis
+ */
+export interface LearnedPattern {
+  id: string;
+  type: string;
+  content: Record<string, unknown>;
+  frequency: number;
   confidence: number;
+  contexts: string[];
+  examples: Array<{ code: string }>;
 }
 
 // ============================================================================
@@ -212,7 +252,7 @@ export interface ISemanticEngine {
   /**
    * Learn semantic concepts from entire codebase
    */
-  learnFromCodebase(path: string, progressCallback?: ProgressCallback): Promise<SemanticConcept[]>;
+  learnFromCodebase(path: string, progressCallback?: ProgressCallback): Promise<LearnedConcept[]>;
 
   /**
    * Search for semantically similar concepts
@@ -233,8 +273,8 @@ export interface ISemanticEngine {
    * Get cache statistics
    */
   getCacheStats(): {
-    fileCache: { size: number };
-    codebaseCache: { size: number };
+    fileCache: { size: number; hitRate?: number };
+    codebaseCache: { size: number; hitRate?: number };
   };
 
   /**
@@ -265,7 +305,7 @@ export interface IPatternEngine {
   /**
    * Learn patterns from entire codebase
    */
-  learnFromCodebase(path: string, progressCallback?: ProgressCallback): Promise<DeveloperPattern[]>;
+  learnFromCodebase(path: string, progressCallback?: ProgressCallback): Promise<LearnedPattern[]>;
 
   /**
    * Find patterns relevant to a problem

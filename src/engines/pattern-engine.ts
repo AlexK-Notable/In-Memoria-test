@@ -3,6 +3,7 @@ import { SQLiteDatabase, DeveloperPattern } from '../storage/sqlite-db.js';
 import { FileChange } from '../watchers/file-watcher.js';
 import { CircuitBreaker, createRustAnalyzerCircuitBreaker } from '../utils/circuit-breaker.js';
 import { nanoid } from 'nanoid';
+import type { IPatternEngine } from '../interfaces/engines.js';
 
 // Local types for Rust binding results
 interface RustPatternResult {
@@ -66,7 +67,7 @@ export interface RelevantPattern {
   confidence: number;
 }
 
-export class PatternEngine {
+export class PatternEngine implements IPatternEngine {
   private rustLearner: InstanceType<typeof PatternLearner>;
   private rustCircuitBreaker: CircuitBreaker;
 

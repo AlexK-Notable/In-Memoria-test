@@ -4,6 +4,7 @@ import { dirname, isAbsolute } from 'path';
 import { DatabaseMigrator } from './migrations.js';
 import { Logger } from '../utils/logger.js';
 import { escapeLikePattern } from '../utils/security.js';
+import type { IStorageProvider } from '../interfaces/engines.js';
 
 export interface SemanticConcept {
   id: string;
@@ -226,7 +227,7 @@ interface ProjectMetadataRow {
 // Type alias for query parameters
 type QueryParams = (string | number | null | boolean)[];
 
-export class SQLiteDatabase {
+export class SQLiteDatabase implements IStorageProvider {
   private db: Database.Database;
   private migrator: DatabaseMigrator;
 

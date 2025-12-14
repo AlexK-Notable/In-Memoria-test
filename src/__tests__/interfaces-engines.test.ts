@@ -215,8 +215,8 @@ describe('Engine Interfaces', () => {
           approach: 'test',
           confidence: 0.9,
           reasoning: 'reasoning',
-          suggestedPatterns: [],
-          estimatedComplexity: 'low',
+          patterns: [],
+          complexity: 'low',
         }),
         buildFeatureMap: vi.fn().mockResolvedValue([]),
         routeRequestToFiles: vi.fn().mockResolvedValue(null),
@@ -241,8 +241,8 @@ describe('Engine Interfaces', () => {
           approach: 'test',
           confidence: 0.9,
           reasoning: '',
-          suggestedPatterns: [],
-          estimatedComplexity: 'low',
+          patterns: [],
+          complexity: 'low',
         }),
         buildFeatureMap: vi.fn().mockResolvedValue([]),
         routeRequestToFiles: vi.fn().mockResolvedValue(null),
@@ -326,15 +326,12 @@ describe('Engine Interfaces', () => {
   describe('Supporting types', () => {
     it('SemanticSearchResult should have required fields', () => {
       const result: SemanticSearchResult = {
-        conceptId: 'id-1',
-        conceptName: 'TestConcept',
-        conceptType: 'class',
+        concept: 'TestConcept',
         similarity: 0.95,
         filePath: '/path/to/file.ts',
-        lineRange: { start: 1, end: 10 },
       };
 
-      expect(result.conceptId).toBe('id-1');
+      expect(result.concept).toBe('TestConcept');
       expect(result.similarity).toBeGreaterThanOrEqual(0);
       expect(result.similarity).toBeLessThanOrEqual(1);
     });
@@ -343,7 +340,7 @@ describe('Engine Interfaces', () => {
       const entryPoint: EntryPoint = {
         type: 'main',
         filePath: '/src/index.ts',
-        description: 'Main entry point',
+        framework: 'express',
       };
 
       expect(entryPoint.type).toBe('main');
@@ -353,13 +350,13 @@ describe('Engine Interfaces', () => {
     it('KeyDirectory should have required fields', () => {
       const keyDir: KeyDirectory = {
         path: '/src/components',
-        purpose: 'React components',
-        importance: 'high',
+        type: 'components',
+        fileCount: 15,
       };
 
       expect(keyDir.path).toBeTruthy();
-      expect(keyDir.purpose).toBeTruthy();
-      expect(['high', 'medium', 'low']).toContain(keyDir.importance);
+      expect(keyDir.type).toBeTruthy();
+      expect(keyDir.fileCount).toBeGreaterThanOrEqual(0);
     });
 
     it('ApproachPrediction should have required fields', () => {
@@ -367,14 +364,14 @@ describe('Engine Interfaces', () => {
         approach: 'Add new component',
         confidence: 0.85,
         reasoning: 'Based on existing patterns',
-        suggestedPatterns: ['Factory', 'Singleton'],
-        estimatedComplexity: 'medium',
+        patterns: ['Factory', 'Singleton'],
+        complexity: 'medium',
       };
 
       expect(prediction.approach).toBeTruthy();
       expect(prediction.confidence).toBeGreaterThanOrEqual(0);
       expect(prediction.confidence).toBeLessThanOrEqual(1);
-      expect(['low', 'medium', 'high']).toContain(prediction.estimatedComplexity);
+      expect(['low', 'medium', 'high']).toContain(prediction.complexity);
     });
 
     it('FileRouting should have required fields', () => {
@@ -384,6 +381,7 @@ describe('Engine Interfaces', () => {
         workType: 'feature',
         suggestedStartPoint: '/src/auth/login.ts',
         confidence: 0.9,
+        reasoning: 'Matched keywords: auth, login. Found 2 relevant files.',
       };
 
       expect(routing.intendedFeature).toBeTruthy();

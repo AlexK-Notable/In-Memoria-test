@@ -5,6 +5,7 @@ import { nanoid } from 'nanoid';
 import { CircuitBreaker, createRustAnalyzerCircuitBreaker } from '../utils/circuit-breaker.js';
 import { globalProfiler } from '../utils/performance-profiler.js';
 import { detectLanguageFromPath as resolveLanguageFromPath } from '../utils/language-registry.js';
+import type { ISemanticEngine } from '../interfaces/engines.js';
 
 // Local types for Rust binding results
 interface RustConceptResult {
@@ -80,7 +81,7 @@ export interface FileAnalysisResult {
   }>;
 }
 
-export class SemanticEngine {
+export class SemanticEngine implements ISemanticEngine {
   private rustAnalyzer: InstanceType<typeof SemanticAnalyzer> | null = null;
   private rustCircuitBreaker: CircuitBreaker;
   private initializationPromise: Promise<void> | null = null;
