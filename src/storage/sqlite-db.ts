@@ -981,6 +981,14 @@ export class SQLiteDatabase implements IStorageProvider {
     };
   }
 
+  /**
+   * Get the underlying better-sqlite3 database instance.
+   * Useful for creating adapters or direct database access.
+   */
+  getDatabase(): Database.Database {
+    return this.db;
+  }
+
   close(): void {
     // Checkpoint WAL before closing to ensure all data is persisted to main database
     // TRUNCATE mode resets WAL file to zero bytes after checkpoint
