@@ -4,7 +4,6 @@
  */
 
 import { join } from 'path';
-import { existsSync } from 'fs';
 import { Logger } from '../utils/logger.js';
 
 export interface InMemoriaConfig {

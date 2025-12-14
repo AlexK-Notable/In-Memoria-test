@@ -11,8 +11,8 @@ import { detectLanguageFromPath } from '../../utils/language-registry.js';
 
 export class MonitoringTools {
   constructor(
-    private semanticEngine: SemanticEngine,
-    private patternEngine: PatternEngine,
+    _semanticEngine: SemanticEngine, // Kept for API compatibility
+    _patternEngine: PatternEngine, // Kept for API compatibility
     private database: SQLiteDatabase,
     private readonly databaseFilePath?: string
   ) { }
@@ -439,7 +439,6 @@ export class MonitoringTools {
   }
 
   private generateStatusSummary(status: any): string {
-    const db = status.components.database;
     const intel = status.intelligence;
 
     if (status.status === 'operational') {

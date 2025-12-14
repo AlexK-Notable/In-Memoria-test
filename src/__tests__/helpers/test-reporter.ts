@@ -5,7 +5,6 @@
  */
 
 import { readFileSync, existsSync, writeFileSync } from 'fs';
-import { join } from 'path';
 
 interface TestResult {
     name: string;

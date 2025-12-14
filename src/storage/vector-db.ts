@@ -1,6 +1,5 @@
 import { Surreal } from 'surrealdb';
 import * as SurrealNodeModule from '@surrealdb/node';
-import { globalProfiler, PerformanceOptimizer } from '../utils/performance-profiler.js';
 import { pipeline } from '@xenova/transformers';
 import { Logger } from '../utils/logger.js';
 
@@ -32,10 +31,20 @@ interface CodeDocument {
   [key: string]: unknown;
 }
 
+/**
+ * Type for embedding pipeline from @xenova/transformers.
+ * Uses a callable interface since the pipeline returns a function-like object.
+ */
+interface EmbeddingPipeline {
+  (text: string, options?: { pooling?: string; normalize?: boolean }): Promise<{ data: Float32Array | number[] }>;
+  dispose?: () => Promise<void>;
+}
+
 export class SemanticVectorDB {
   private db: Surreal;
   private initialized: boolean = false;
-  private localEmbeddingPipeline: any; // Use any to avoid complex typing issues
+  private localEmbeddingPipeline: EmbeddingPipeline | null = null;
+  private embeddingInitPromise: Promise<void> | null = null;
 
   // Real vector operations with caching
   private embeddingCache = new Map<string, number[]>();
@@ -45,13 +54,33 @@ export class SemanticVectorDB {
   // Embedding progress tracking
   private hasLoggedEmbeddingStart = false;
 
+  // Security: Allowlist of valid filter keys to prevent injection attacks
+  private static readonly ALLOWED_FILTER_KEYS = new Set([
+    'filePath', 'language', 'conceptType', 'patternType',
+    'framework', 'projectPath', 'fileHash', 'functionName',
+    'className', 'complexity', 'lineCount'
+  ]);
+
   constructor(_apiKey?: string) {
-    this.db = new Surreal({
-      engines: (SurrealNodeModule as any).surrealdbNodeEngines(),
-    });
+    // SurrealDB module type assertion required due to dynamic engine loading
+    // The @surrealdb/node module dynamically provides engines but lacks proper type exports
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    this.db = new Surreal({ engines: (SurrealNodeModule as any).surrealdbNodeEngines() });
 
     // API key parameter kept for backwards compatibility but unused
-    this.initializeLocalEmbeddings();
+    // Store promise so we can await initialization later if needed
+    this.embeddingInitPromise = this.initializeLocalEmbeddings();
+  }
+
+  /**
+   * Wait for embedding pipeline to be ready.
+   * Call this before operations that require embeddings.
+   */
+  async waitForEmbeddingReady(): Promise<boolean> {
+    if (this.embeddingInitPromise) {
+      await this.embeddingInitPromise;
+    }
+    return this.localEmbeddingPipeline !== null;
   }
 
   /**
@@ -61,14 +90,17 @@ export class SemanticVectorDB {
     try {
       Logger.info('🔧 Initializing local embedding pipeline...');
       // Use all-MiniLM-L6-v2 for quality local embeddings
-      this.localEmbeddingPipeline = await pipeline(
+      const embeddingPipeline = await pipeline(
         'feature-extraction',
         'Xenova/all-MiniLM-L6-v2'
       );
+      // Cast to our interface type
+      this.localEmbeddingPipeline = embeddingPipeline as unknown as EmbeddingPipeline;
       Logger.info('✅ Local embedding pipeline ready');
     } catch (error: unknown) {
       Logger.warn('⚠️  Failed to initialize local embeddings:', error instanceof Error ? error.message : String(error));
       Logger.info('📝 Will use fallback local embedding method');
+      this.localEmbeddingPipeline = null;
     }
   }
 
@@ -149,6 +181,22 @@ export class SemanticVectorDB {
     }
   }
 
+  /**
+   * Validate and sanitize filter keys against allowlist.
+   * Returns only valid filters, logging warnings for invalid keys.
+   */
+  private validateFilters(filters: Record<string, any>): Record<string, any> {
+    const validFilters: Record<string, any> = {};
+    for (const [key, value] of Object.entries(filters)) {
+      if (SemanticVectorDB.ALLOWED_FILTER_KEYS.has(key)) {
+        validFilters[key] = value;
+      } else {
+        Logger.warn(`VectorDB: Ignoring invalid filter key "${key}" - not in allowlist`);
+      }
+    }
+    return validFilters;
+  }
+
   async findSimilarCode(
     query: string,
     limit: number = 5,
@@ -158,17 +206,20 @@ export class SemanticVectorDB {
       throw new Error('Vector database not initialized. Call initialize() first.');
     }
 
+    // Validate filters against allowlist to prevent injection
+    const validFilters = filters ? this.validateFilters(filters) : undefined;
+
     if (!query || query.trim() === '') {
       // If no query, just return all documents matching filters
       let searchQuery = 'SELECT * FROM code_documents';
       const params: Record<string, any> = { limit };
 
-      if (filters) {
-        const filterConditions = Object.entries(filters)
-          .map(([key, value]) => `metadata.${key} = $${key}`)
+      if (validFilters && Object.keys(validFilters).length > 0) {
+        const filterConditions = Object.entries(validFilters)
+          .map(([key, _]) => `metadata.${key} = $${key}`)
           .join(' AND ');
         searchQuery += ` WHERE ${filterConditions}`;
-        Object.assign(params, filters);
+        Object.assign(params, validFilters);
       }
 
       searchQuery += ` LIMIT $limit`;
@@ -186,15 +237,15 @@ export class SemanticVectorDB {
 
     // Use SurrealDB's full-text search for semantic similarity
     let searchQuery = `
-      SELECT *, search::score(1) AS similarity 
-      FROM code_documents 
+      SELECT *, search::score(1) AS similarity
+      FROM code_documents
       WHERE code @@ $query
     `;
 
     // Add filters if provided
-    if (filters) {
-      const filterConditions = Object.entries(filters)
-        .map(([key, value]) => `metadata.${key} = $${key}`)
+    if (validFilters && Object.keys(validFilters).length > 0) {
+      const filterConditions = Object.entries(validFilters)
+        .map(([key, _]) => `metadata.${key} = $${key}`)
         .join(' AND ');
       searchQuery += ` AND ${filterConditions}`;
     }
@@ -202,8 +253,8 @@ export class SemanticVectorDB {
     searchQuery += ` ORDER BY similarity DESC LIMIT $limit`;
 
     const params: Record<string, any> = { query, limit };
-    if (filters) {
-      Object.assign(params, filters);
+    if (validFilters) {
+      Object.assign(params, validFilters);
     }
 
     const results = await this.db.query(searchQuery, params);
@@ -374,11 +425,6 @@ export class SemanticVectorDB {
   }
 
   /**
-   * For backward compatibility - use the proper local embedding method
-   */
-  private async generateLocalEmbedding(text: string): Promise<number[]> {
-    return this.getLocalEmbedding(text);
-  }  /**
    * Extract structural code features
    */
   private extractStructuralFeatures(code: string): number[] {
@@ -669,35 +715,6 @@ export class SemanticVectorDB {
     const magnitude = Math.sqrt(vector.reduce((sum, val) => sum + val * val, 0));
     if (magnitude === 0) return vector;
     return vector.map(val => val / magnitude);
-  }
-
-  private getVocabulary(): string[] {
-    // Common programming terms vocabulary
-    return [
-      'function', 'class', 'method', 'variable', 'const', 'let', 'var', 'return',
-      'if', 'else', 'for', 'while', 'loop', 'array', 'object', 'string', 'number',
-      'boolean', 'null', 'undefined', 'true', 'false', 'import', 'export', 'from',
-      'default', 'async', 'await', 'promise', 'callback', 'event', 'handler',
-      'component', 'props', 'state', 'render', 'dom', 'element', 'node', 'tree',
-      'data', 'type', 'interface', 'enum', 'struct', 'trait', 'impl', 'pub',
-      'private', 'public', 'protected', 'static', 'final', 'abstract', 'virtual',
-      'override', 'extends', 'implements', 'constructor', 'destructor', 'this',
-      'self', 'super', 'new', 'delete', 'malloc', 'free', 'memory', 'pointer',
-      'reference', 'value', 'copy', 'move', 'clone', 'borrow', 'lifetime',
-      'generic', 'template', 'macro', 'annotation', 'decorator', 'attribute',
-      'property', 'field', 'member', 'parameter', 'argument', 'result', 'error',
-      'exception', 'try', 'catch', 'finally', 'throw', 'raise', 'panic',
-      'test', 'assert', 'debug', 'log', 'print', 'console', 'output', 'input',
-      'file', 'path', 'directory', 'folder', 'read', 'write', 'create', 'delete',
-      'update', 'insert', 'select', 'query', 'database', 'table', 'column',
-      'index', 'key', 'value', 'pair', 'map', 'set', 'list', 'vector', 'stack',
-      'queue', 'heap', 'tree', 'graph', 'node', 'edge', 'vertex', 'algorithm',
-      'sort', 'search', 'find', 'filter', 'reduce', 'map', 'foreach', 'iterate',
-      'recursive', 'iteration', 'condition', 'check', 'validate', 'verify',
-      'process', 'thread', 'sync', 'async', 'parallel', 'concurrent', 'mutex',
-      'lock', 'atomic', 'volatile', 'safe', 'unsafe', 'security', 'encrypt',
-      'decrypt', 'hash', 'random', 'uuid', 'token', 'auth', 'login', 'logout'
-    ];
   }
 
   // Cleanup method

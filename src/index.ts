@@ -14,6 +14,7 @@ import { InteractiveSetup } from './cli/interactive-setup.js';
 import { DebugTools } from './cli/debug-tools.js';
 import { config } from './config/config.js';
 import { Logger } from './utils/logger.js';
+import { shutdownManager } from './utils/shutdown-manager.js';
 
 function getVersion(): string {
   try {
@@ -183,13 +184,17 @@ async function startWatcher(path: string): Promise<void> {
   watcher.startWatching();
   console.log('File watcher started. Press Ctrl+C to stop.');
 
-  // Handle graceful shutdown
-  process.on('SIGINT', () => {
-    console.log('\nStopping file watcher...');
+  // Register cleanup handlers with ShutdownManager
+  shutdownManager.register('File Watcher', async () => {
     watcher.stopWatching();
+  }, 10);
+
+  shutdownManager.register('Watcher Database', async () => {
     database.close();
-    process.exit(0);
-  });
+  }, 50);
+
+  // Install signal handlers
+  shutdownManager.installSignalHandlers();
 }
 
 async function learnCodebase(path: string): Promise<void> {
@@ -235,7 +240,8 @@ async function learnCodebase(path: string): Promise<void> {
     // Check if learning failed
     if (!result.success) {
       console.error('❌ Learning failed - see details above');
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
 
     // Print summary
@@ -248,10 +254,9 @@ async function learnCodebase(path: string): Promise<void> {
     console.log(`${separator}\n`);
   } catch (error) {
     console.error(`❌ Learning failed: ${error}`);
-  } finally {
-    // Force process exit to ensure cleanup of any remaining resources
-    process.exit(0);
+    process.exitCode = 1;
   }
+  // Process exits naturally when main() completes - no forced exit needed
 }
 
 async function analyzeCodebase(path: string): Promise<void> {

@@ -2,7 +2,7 @@ import * as chokidar from 'chokidar';
 import { EventEmitter } from 'eventemitter3';
 import { createHash } from 'crypto';
 import { readFileSync, statSync } from 'fs';
-import { join, extname } from 'path';
+import { extname } from 'path';
 import { detectLanguageFromPath } from '../utils/language-registry.js';
 
 export interface FileChange {
@@ -271,7 +271,7 @@ export class FileWatcher extends EventEmitter {
   }
 
   // Utility methods for advanced filtering
-  addIgnorePattern(pattern: string): void {
+  addIgnorePattern(_pattern: string): void {
     if (this.watcher) {
       // Note: chokidar doesn't support dynamic ignore pattern updates
       // This would require restarting the watcher

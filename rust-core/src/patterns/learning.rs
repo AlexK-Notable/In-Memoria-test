@@ -1050,7 +1050,7 @@ impl PatternLearningEngine {
                 consolidated.insert(group_key, group_patterns.into_iter().next().unwrap());
             } else {
                 // Merge patterns in the group
-                let merged = self.merge_similar_patterns(group_patterns);
+                let merged = self.merge_similar_patterns(group_patterns)?;
                 consolidated.insert(group_key, merged);
             }
         }
@@ -1070,9 +1070,12 @@ impl PatternLearningEngine {
             .join("_")
     }
 
-    fn merge_similar_patterns(&self, patterns: Vec<Pattern>) -> Pattern {
+    fn merge_similar_patterns(&self, patterns: Vec<Pattern>) -> Result<Pattern, ParseError> {
         if patterns.is_empty() {
-            panic!("Cannot merge empty pattern list");
+            #[cfg(feature = "napi-bindings")]
+            return Err(napi::Error::from_reason("Cannot merge empty pattern list"));
+            #[cfg(not(feature = "napi-bindings"))]
+            return Err(ParseError::from_reason("Cannot merge empty pattern list"));
         }
 
         let first = &patterns[0];
@@ -1090,7 +1093,7 @@ impl PatternLearningEngine {
         // Limit examples to avoid bloat
         all_examples.truncate(10);
 
-        Pattern {
+        Ok(Pattern {
             id: first.id.clone(),
             pattern_type: first.pattern_type.clone(),
             description: format!(
@@ -1102,7 +1105,7 @@ impl PatternLearningEngine {
             confidence: avg_confidence,
             examples: all_examples,
             contexts: all_contexts.into_iter().collect(),
-        }
+        })
     }
 
     fn update_learning_metrics(&mut self, patterns: &[Pattern], session: &LearningSession) {
@@ -2090,10 +2093,19 @@ class UserService {
             },
         ];
 
-        let merged = engine.merge_similar_patterns(patterns);
+        let merged = engine.merge_similar_patterns(patterns).unwrap();
 
         assert_eq!(merged.frequency, 8); // 5 + 3
         assert_eq!(merged.confidence, 0.7); // (0.8 + 0.6) / 2
         assert_eq!(merged.contexts.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_empty_patterns_returns_error() {
+        let engine = PatternLearningEngine::new();
+        let patterns: Vec<Pattern> = vec![];
+
+        let result = engine.merge_similar_patterns(patterns);
+        assert!(result.is_err(), "Should return error for empty pattern list");
     }
 }

@@ -1,5 +1,5 @@
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
-import { 
+import {
   CodingContextSchema,
   AIInsightsSchema,
   type CodingContext,
@@ -13,15 +13,27 @@ import { SemanticEngine } from '../../engines/semantic-engine.js';
 import { PatternEngine } from '../../engines/pattern-engine.js';
 import { SQLiteDatabase } from '../../storage/sqlite-db.js';
 import { SemanticVectorDB } from '../../storage/vector-db.js';
-import { config } from '../../config/config.js';
 import { PathValidator } from '../../utils/path-validator.js';
+import type { DeveloperPattern } from '../../types/index.js';
+
+// Local types for intelligence operations
+interface SessionUpdatePayload {
+  currentFiles?: string[];
+  lastFeature?: string;
+  pendingTasks?: string[];
+}
+
+interface BlueprintDirectory {
+  directoryType: string;
+  path?: string;
+}
 
 export class IntelligenceTools {
   constructor(
-    private semanticEngine: SemanticEngine,
+    _semanticEngine: SemanticEngine, // Kept for API compatibility
     private patternEngine: PatternEngine,
     private database: SQLiteDatabase,
-    private vectorDB?: SemanticVectorDB // Receive vectorDB instance from server
+    _vectorDB?: SemanticVectorDB // Kept for API compatibility
   ) {}
 
   get tools(): Tool[] {
@@ -288,8 +300,6 @@ export class IntelligenceTools {
     relatedFiles?: string[];
   }> {
     const context = CodingContextSchema.parse(args);
-    // Limit patterns fetched to prevent token overflow
-    const patterns = this.database.getDeveloperPatterns(undefined, 100);
 
     // Get relevant patterns based on context
     const relevantPatterns = await this.patternEngine.findRelevantPatterns(
@@ -529,7 +539,7 @@ export class IntelligenceTools {
     }
 
     if (session) {
-      const updates: any = {};
+      const updates: SessionUpdatePayload = {};
 
       if (sessionUpdate.files) {
         updates.currentFiles = sessionUpdate.files;
@@ -633,7 +643,7 @@ export class IntelligenceTools {
    * Get learning/intelligence status for the project
    * Phase 4: Merged from automation-tools get_learning_status
    */
-  private async getLearningStatus(database: SQLiteDatabase, projectPath: string): Promise<{
+  private async getLearningStatus(database: SQLiteDatabase, _projectPath: string): Promise<{
     hasIntelligence: boolean;
     isStale: boolean;
     conceptsStored: number;
@@ -672,64 +682,7 @@ export class IntelligenceTools {
     }
   }
 
-  private async checkExistingIntelligence(path: string): Promise<{ concepts: number; patterns: number } | null> {
-    const concepts = this.database.getSemanticConcepts().length;
-    const patterns = this.database.getDeveloperPatterns().length;
-    
-    if (concepts > 0 || patterns > 0) {
-      return { concepts, patterns };
-    }
-    
-    console.warn('⚠️  No existing intelligence found - starting fresh analysis');
-    return null; // Null is honest here - we genuinely found no existing data
-  }
-
-  private async checkExistingIntelligenceInDatabase(database: SQLiteDatabase, path: string): Promise<{ concepts: number; patterns: number } | null> {
-    const concepts = database.getSemanticConcepts().length;
-    const patterns = database.getDeveloperPatterns().length;
-    
-    if (concepts > 0 || patterns > 0) {
-      return { concepts, patterns };
-    }
-    
-    console.warn('⚠️  No existing intelligence found in project database - starting fresh analysis');
-    return null;
-  }
-
-  private async storeIntelligence(
-    path: string, 
-    concepts: any[], 
-    patterns: any[]
-  ): Promise<void> {
-    // Store concepts
-    for (const concept of concepts) {
-      this.database.insertSemanticConcept({
-        id: concept.id,
-        conceptName: concept.name,
-        conceptType: concept.type,
-        confidenceScore: concept.confidence,
-        relationships: concept.relationships,
-        evolutionHistory: {},
-        filePath: concept.filePath,
-        lineRange: concept.lineRange
-      });
-    }
-
-    // Store patterns
-    for (const pattern of patterns) {
-      this.database.insertDeveloperPattern({
-        patternId: pattern.id,
-        patternType: pattern.type,
-        patternContent: pattern.content,
-        frequency: pattern.frequency,
-        contexts: pattern.contexts,
-        examples: pattern.examples,
-        confidence: pattern.confidence
-      });
-    }
-  }
-
-  private extractNamingConventions(patterns: any[]): Record<string, string> {
+  private extractNamingConventions(_patterns: DeveloperPattern[]): Record<string, string> {
     return {
       functions: 'camelCase',
       classes: 'PascalCase',
@@ -738,180 +691,23 @@ export class IntelligenceTools {
     };
   }
 
-  private extractStructuralPreferences(patterns: any[]): string[] {
+  private extractStructuralPreferences(_patterns: DeveloperPattern[]): string[] {
     return ['modular_design', 'single_responsibility', 'dependency_injection'];
   }
 
-  private extractTestingApproach(patterns: any[]): string {
+  private extractTestingApproach(_patterns: DeveloperPattern[]): string {
     return 'unit_testing_with_jest';
   }
 
-  private extractExpertiseAreas(patterns: any[]): string[] {
+  private extractExpertiseAreas(_patterns: DeveloperPattern[]): string[] {
     return ['typescript', 'react', 'node.js', 'database_design'];
   }
 
-  private extractRecentFocus(patterns: any[]): string[] {
-    return patterns.map(p => p.type).slice(0, 5);
+  private extractRecentFocus(patterns: DeveloperPattern[]): string[] {
+    return patterns.map(p => p.patternType).slice(0, 5);
   }
 
-  private async analyzeCodebaseRelationships(
-    concepts: any[], 
-    patterns: any[]
-  ): Promise<{ conceptRelationships: number; dependencyPatterns: number }> {
-    // Analyze semantic relationships between concepts
-    const conceptRelationships = new Set<string>();
-    
-    // Group concepts by file to find file-level relationships
-    const conceptsByFile = concepts.reduce((acc, concept) => {
-      const filePath = concept.filePath || concept.file_path || 'unknown';
-      if (!acc[filePath]) acc[filePath] = [];
-      acc[filePath].push(concept);
-      return acc;
-    }, {} as Record<string, any[]>);
-    
-    // Find relationships within files
-    Object.values(conceptsByFile).forEach(fileConcepts => {
-      if (Array.isArray(fileConcepts)) {
-        for (let i = 0; i < fileConcepts.length; i++) {
-          for (let j = i + 1; j < fileConcepts.length; j++) {
-            const relationshipKey = `${fileConcepts[i].id}-${fileConcepts[j].id}`;
-            conceptRelationships.add(relationshipKey);
-          }
-        }
-      }
-    });
-    
-    // Analyze dependency patterns from imports/references
-    const dependencyPatterns = new Set<string>();
-    patterns.forEach(pattern => {
-      const patternType = pattern.type || '';
-      if (patternType.includes('dependency') || 
-          patternType.includes('import') ||
-          patternType.includes('organization')) {
-        dependencyPatterns.add(pattern.id);
-      }
-    });
-    
-    return {
-      conceptRelationships: conceptRelationships.size,
-      dependencyPatterns: dependencyPatterns.size
-    };
-  }
-
-  private async generateLearningInsights(
-    concepts: any[], 
-    patterns: any[], 
-    codebaseAnalysis: any
-  ): Promise<string[]> {
-    const insights: string[] = [];
-    
-    // Analyze codebase characteristics
-    const totalLines = codebaseAnalysis.complexity?.lines || 0;
-    const conceptDensity = totalLines > 0 ? (concepts.length / totalLines * 1000).toFixed(2) : '0';
-    insights.push(`📊 Concept density: ${conceptDensity} concepts per 1000 lines`);
-    
-    // Analyze pattern distribution
-    const namingPatterns = patterns.filter(p => p.type?.includes('naming'));
-    const structuralPatterns = patterns.filter(p => p.type?.includes('organization') || p.type?.includes('structure'));
-    const implementationPatterns = patterns.filter(p => p.type?.includes('implementation'));
-    
-    if (namingPatterns.length > 0) {
-      insights.push(`✨ Strong naming conventions detected (${namingPatterns.length} patterns)`);
-    }
-    if (structuralPatterns.length > 0) {
-      insights.push(`🏗️ Organized code structure found (${structuralPatterns.length} patterns)`);
-    }
-    if (implementationPatterns.length > 0) {
-      insights.push(`⚙️ Design patterns in use (${implementationPatterns.length} patterns)`);
-    }
-    
-    // Analyze complexity
-    const complexity = codebaseAnalysis.complexity;
-    if (complexity) {
-      if (complexity.cyclomatic < 10) {
-        insights.push('🟢 Low complexity codebase - easy to maintain');
-      } else if (complexity.cyclomatic < 30) {
-        insights.push('🟡 Moderate complexity - consider refactoring high-complexity areas');
-      } else {
-        insights.push('🔴 High complexity detected - refactoring recommended');
-      }
-    }
-    
-    // Analyze language and framework usage
-    const languages = codebaseAnalysis.languages || [];
-    const frameworks = codebaseAnalysis.frameworks || [];
-    
-    if (languages.length === 1) {
-      insights.push(`🎯 Single-language codebase (${languages[0]}) - consistent technology stack`);
-    } else if (languages.length > 1) {
-      insights.push(`🌐 Multi-language codebase (${languages.join(', ')}) - consider integration patterns`);
-    }
-    
-    if (frameworks.length > 0) {
-      insights.push(`🔧 Framework usage: ${frameworks.join(', ')}`);
-    }
-    
-    return insights;
-  }
-
-  private async storeProjectBlueprint(
-    projectPath: string,
-    codebaseAnalysis: any,
-    database: SQLiteDatabase
-  ): Promise<void> {
-    const { nanoid } = await import('nanoid');
-
-    // Store entry points
-    if (codebaseAnalysis.entryPoints && Array.isArray(codebaseAnalysis.entryPoints)) {
-      for (const entryPoint of codebaseAnalysis.entryPoints) {
-        database.insertEntryPoint({
-          id: nanoid(),
-          projectPath,
-          entryType: entryPoint.type,
-          filePath: entryPoint.filePath,
-          description: entryPoint.description,
-          framework: entryPoint.framework
-        });
-      }
-    }
-
-    // Store key directories
-    if (codebaseAnalysis.keyDirectories && Array.isArray(codebaseAnalysis.keyDirectories)) {
-      for (const directory of codebaseAnalysis.keyDirectories) {
-        database.insertKeyDirectory({
-          id: nanoid(),
-          projectPath,
-          directoryPath: directory.path,
-          directoryType: directory.type,
-          fileCount: directory.fileCount,
-          description: directory.description
-        });
-      }
-    }
-  }
-
-  private inferArchitecturePattern(codebaseAnalysis: any): string {
-    const frameworks = codebaseAnalysis.frameworks || [];
-    const directories = codebaseAnalysis.keyDirectories || [];
-
-    if (frameworks.some((f: string) => f.toLowerCase().includes('react'))) {
-      return 'Component-Based (React)';
-    } else if (frameworks.some((f: string) => f.toLowerCase().includes('express'))) {
-      return 'REST API (Express)';
-    } else if (frameworks.some((f: string) => f.toLowerCase().includes('fastapi'))) {
-      return 'REST API (FastAPI)';
-    } else if (directories.some((d: any) => d.type === 'services')) {
-      return 'Service-Oriented';
-    } else if (directories.some((d: any) => d.type === 'components')) {
-      return 'Component-Based';
-    } else if (directories.some((d: any) => d.type === 'models' && d.type === 'views')) {
-      return 'MVC Pattern';
-    } else {
-      return 'Modular';
-    }
-  }
-
-  private inferArchitectureFromBlueprint(blueprint: { frameworks: string[]; keyDirectories: any[] }): string {
+  private inferArchitectureFromBlueprint(blueprint: { frameworks: string[]; keyDirectories: BlueprintDirectory[] }): string {
     const { frameworks, keyDirectories } = blueprint;
 
     if (frameworks.some(f => f.toLowerCase().includes('react'))) {
@@ -928,59 +724,6 @@ export class IntelligenceTools {
       return 'MVC Pattern';
     } else {
       return 'Modular';
-    }
-  }
-
-  private async buildSemanticIndex(concepts: any[], patterns: any[]): Promise<number> {
-    try {
-      // Use the shared vector DB instance if available
-      const vectorDB = this.vectorDB;
-      if (!vectorDB) {
-        console.warn('No vector database available for semantic indexing');
-        return 0;
-      }
-      
-      // Initialize vector DB if not already done
-      await vectorDB.initialize('in-memoria-intelligence');
-      
-      let vectorCount = 0;
-      
-      // Create embeddings for semantic concepts
-      for (const concept of concepts) {
-        const conceptType = concept.type || 'unknown';
-        const text = `${concept.name} ${conceptType}`;
-        await vectorDB.storeCodeEmbedding(text, {
-          id: concept.id,
-          filePath: concept.filePath,
-          functionName: conceptType === 'function' ? concept.name : undefined,
-          className: conceptType === 'class' ? concept.name : undefined,
-          language: 'unknown',
-          complexity: 1,
-          lineCount: 1,
-          lastModified: new Date()
-        });
-        vectorCount++;
-      }
-      
-      // Create embeddings for patterns
-      for (const pattern of patterns) {
-        const patternType = pattern.type || 'unknown';
-        const text = `${patternType} ${pattern.content?.description || ''}`;
-        await vectorDB.storeCodeEmbedding(text, {
-          id: pattern.id,
-          filePath: `pattern-${patternType}`,
-          language: 'pattern',
-          complexity: pattern.frequency || 1,
-          lineCount: 1,
-          lastModified: new Date()
-        });
-        vectorCount++;
-      }
-      
-      return vectorCount;
-    } catch (error) {
-      console.warn('Failed to build semantic index:', error);
-      return 0;
     }
   }
 }

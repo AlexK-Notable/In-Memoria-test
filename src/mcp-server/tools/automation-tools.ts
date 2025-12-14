@@ -6,7 +6,6 @@ import { ProgressTracker } from '../../utils/progress-tracker.js';
 import { ConsoleProgressRenderer } from '../../utils/console-progress.js';
 import { glob } from 'glob';
 import { statSync, existsSync } from 'fs';
-import { join } from 'path';
 
 export class AutomationTools {
   constructor(
@@ -251,7 +250,7 @@ export class AutomationTools {
           concepts = await Promise.race([
             this.semanticEngine.learnFromCodebase(
               projectPath,
-              (current: number, total: number, message: string) => {
+              (current: number, _total: number, message: string) => {
                 // Update progress tracker with real-time updates from semantic engine
                 tracker.updateProgress('semantic_analysis', current, message);
               }
@@ -277,13 +276,12 @@ export class AutomationTools {
       }
 
       // Phase 3: Pattern Learning
-      const patternStart = Date.now();
       tracker.startPhase('pattern_learning');
       tracker.updateProgress('pattern_learning', 1, 'Analyzing code patterns...');
 
       const patterns = await this.patternEngine.learnFromCodebase(
         projectPath,
-        (current: number, total: number, message: string) => {
+        (current: number, _total: number, message: string) => {
           // Update progress tracker with real-time updates from pattern engine
           // Map the 0-100 range to the actual file count
           const mapped = Math.floor((current / 100) * files.codeFiles);
@@ -291,18 +289,15 @@ export class AutomationTools {
         }
       );
 
-      const patternTime = Date.now() - patternStart;
       tracker.complete('pattern_learning');
 
       // Phase 4: Indexing
-      const indexStart = Date.now();
       tracker.startPhase('indexing');
       tracker.updateProgress('indexing', 1, 'Indexing concepts and patterns...');
 
       // Indexing happens in-memory, mark progress
       tracker.updateProgress('indexing', Math.floor(files.codeFiles / 2), 'Building search structures...');
 
-      const indexTime = Date.now() - indexStart;
       tracker.complete('indexing');
 
       progressRenderer.stop();

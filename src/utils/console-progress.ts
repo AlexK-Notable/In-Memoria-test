@@ -1,4 +1,4 @@
-import { ProgressTracker, ProgressUpdate } from './progress-tracker.js';
+import { ProgressTracker } from './progress-tracker.js';
 
 export class ConsoleProgressRenderer {
   private tracker: ProgressTracker;
@@ -103,17 +103,6 @@ export class ConsoleProgressRenderer {
     if (!this.hasShownCompletionMessage) {
       process.stderr.write('✅ Learning Complete!\n\n');
       this.hasShownCompletionMessage = true;
-    }
-  }
-
-  private formatElapsed(elapsed: number): string {
-    const seconds = Math.floor(elapsed / 1000);
-    const minutes = Math.floor(seconds / 60);
-
-    if (minutes > 0) {
-      return `${minutes}m ${seconds % 60}s`;
-    } else {
-      return `${seconds}s`;
     }
   }
 

@@ -4,6 +4,39 @@ import { FileChange } from '../watchers/file-watcher.js';
 import { CircuitBreaker, createRustAnalyzerCircuitBreaker } from '../utils/circuit-breaker.js';
 import { nanoid } from 'nanoid';
 
+// Local types for Rust binding results
+interface RustPatternResult {
+  id?: string;
+  patternType: string;
+  patternContent?: Record<string, unknown>;
+  description?: string;
+  frequency: number;
+  confidence?: number;
+  contexts?: string[];
+  examples?: Array<{ code: string }>;
+}
+
+interface RustFeatureMapResult {
+  id: string;
+  featureName?: string;
+  feature_name?: string;
+  primaryFiles?: string[];
+  primary_files?: string[];
+  relatedFiles?: string[];
+  related_files?: string[];
+  dependencies?: string[];
+}
+
+interface PatternAnalysisInput {
+  patterns?: {
+    detected?: string[];
+  };
+  change?: {
+    path?: string;
+    language?: string;
+  };
+}
+
 export interface PatternExtractionResult {
   type: string;
   description: string;
@@ -45,9 +78,9 @@ export class PatternEngine {
   async extractPatterns(path: string): Promise<PatternExtractionResult[]> {
     try {
       const patterns = await this.rustLearner.extractPatterns(path);
-      return patterns.map((p: any) => ({
+      return patterns.map((p: RustPatternResult) => ({
         type: p.patternType,
-        description: p.description,
+        description: p.description || '',
         frequency: p.frequency
       }));
     } catch (error) {
@@ -129,7 +162,7 @@ export class PatternEngine {
     return patternDescriptions[patternType] || null;
   }
 
-  private fallbackFilePatternAnalysis(content: string, filePath: string): Array<{
+  private fallbackFilePatternAnalysis(content: string, _filePath: string): Array<{
     type: string;
     description: string;
     confidence: number;
@@ -211,7 +244,7 @@ export class PatternEngine {
         }, 1000); // Update every second
       }
       
-      let patterns: any[];
+      let patterns: RustPatternResult[];
       try {
         patterns = await this.rustLearner.learnFromCodebase(path);
       } finally {
@@ -220,19 +253,19 @@ export class PatternEngine {
           clearInterval(progressInterval);
         }
       }
-      
+
       if (progressCallback) {
         progressCallback(90, 100, `Extracted ${patterns.length} patterns, storing...`);
       }
-      
-      const result = patterns.map((p: any) => ({
-        id: p.id,
+
+      const result = patterns.map((p: RustPatternResult) => ({
+        id: p.id || nanoid(),
         type: p.patternType,
-        content: { description: p.description },
+        content: { description: p.description || '' },
         frequency: p.frequency,
-        confidence: p.confidence,
-        contexts: p.contexts,
-        examples: p.examples.map((ex: any) => ({ code: ex.code }))
+        confidence: p.confidence || 0,
+        contexts: p.contexts || [],
+        examples: (p.examples || []).map((ex: { code: string }) => ({ code: ex.code }))
       }));
 
       // Store patterns in database with progress updates
@@ -292,12 +325,12 @@ export class PatternEngine {
         detected: analysis.detected,
         violations: analysis.violations,
         recommendations: analysis.recommendations,
-        learned: analysis.learned?.map((p: any) => ({
-          id: p.id,
+        learned: analysis.learned?.map((p: RustPatternResult) => ({
+          id: p.id || nanoid(),
           type: p.patternType,
-          content: { description: p.description },
+          content: { description: p.description || '' },
           frequency: p.frequency,
-          confidence: p.confidence
+          confidence: p.confidence || 0
         }))
       };
     } catch (error) {
@@ -308,8 +341,8 @@ export class PatternEngine {
 
   async findRelevantPatterns(
     problemDescription: string,
-    currentFile?: string,
-    selectedCode?: string
+    _currentFile?: string,
+    _selectedCode?: string
   ): Promise<RelevantPattern[]> {
     // console.error(`\n🔍 findRelevantPatterns called`);
     // console.error(`   problemDescription: "${problemDescription}"`);
@@ -353,7 +386,7 @@ export class PatternEngine {
       .filter(({ score }) => score > 0.3)
       .sort((a, b) => b.score - a.score)
       .slice(0, 10) // Limit to top 10 patterns
-      .map(({ pattern, score }) => {
+      .map(({ pattern, score: _score }) => {
         // console.error(`   ✓ Pattern "${pattern.patternType}" scored ${score.toFixed(2)}`);
 
         return {
@@ -416,7 +449,7 @@ export class PatternEngine {
     }
   }
 
-  async learnFromAnalysis(analysisData: any): Promise<void> {
+  async learnFromAnalysis(analysisData: PatternAnalysisInput): Promise<void> {
     try {
       await this.rustLearner.learnFromAnalysis(JSON.stringify(analysisData));
       
@@ -512,7 +545,7 @@ export class PatternEngine {
     };
   }
 
-  private fallbackPatternExtraction(path: string): PatternExtractionResult[] {
+  private fallbackPatternExtraction(_path: string): PatternExtractionResult[] {
     // Pattern extraction using TypeScript analysis
     return [
       {
@@ -547,37 +580,6 @@ export class PatternEngine {
     }
 
     return { detected, violations, recommendations };
-  }
-
-  private fallbackRelevantPatterns(problemDescription: string): RelevantPattern[] {
-    // Simple keyword-based pattern matching
-    const patterns: RelevantPattern[] = [];
-    
-    if (problemDescription.toLowerCase().includes('test')) {
-      patterns.push({
-        patternId: 'test_pattern',
-        patternType: 'testing',
-        patternContent: { description: 'Testing pattern recommendation' },
-        frequency: 5,
-        contexts: ['testing'],
-        examples: [{ code: 'describe("test", () => { it("should work", () => {}) })' }],
-        confidence: 0.6
-      });
-    }
-
-    if (problemDescription.toLowerCase().includes('api') || problemDescription.toLowerCase().includes('endpoint')) {
-      patterns.push({
-        patternId: 'api_pattern',
-        patternType: 'api_design',
-        patternContent: { description: 'RESTful API pattern' },
-        frequency: 8,
-        contexts: ['api', 'rest'],
-        examples: [{ code: 'app.get("/api/resource", (req, res) => {})' }],
-        confidence: 0.7
-      });
-    }
-
-    return patterns;
   }
 
   private fallbackApproachPrediction(problemDescription: string): {
@@ -653,19 +655,19 @@ export class PatternEngine {
     const rustImplementation = async () => {
       const featureMaps = await BlueprintAnalyzer.buildFeatureMap(projectPath);
 
-      return featureMaps.map((fm: any) => ({
+      return featureMaps.map((fm: RustFeatureMapResult) => ({
         id: fm.id,
-        featureName: fm.featureName || fm.feature_name, // Try camelCase first, fallback to snake_case
-        primaryFiles: fm.primaryFiles || fm.primary_files,
-        relatedFiles: fm.relatedFiles || fm.related_files,
-        dependencies: fm.dependencies,
+        featureName: fm.featureName || fm.feature_name || 'unknown', // Try camelCase first, fallback to snake_case
+        primaryFiles: fm.primaryFiles || fm.primary_files || [],
+        relatedFiles: fm.relatedFiles || fm.related_files || [],
+        dependencies: fm.dependencies || [],
       }));
     };
 
     // TypeScript fallback implementation
     const fallbackImplementation = async () => {
       const { access } = await import('fs/promises');
-      const { join, relative, resolve } = await import('path');
+      const { join, resolve } = await import('path');
       const { constants } = await import('fs');
 
       const featureMap: Array<{

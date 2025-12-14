@@ -5,6 +5,52 @@ import { SemanticVectorDB } from '../storage/vector-db.js';
 import { config } from '../config/config.js';
 import { nanoid } from 'nanoid';
 
+// Local types for learning operations
+interface LearnedConcept {
+  id: string;
+  name: string;
+  type: string;
+  confidence: number;
+  filePath?: string;
+  file_path?: string;
+  lineRange: { start: number; end: number };
+  relationships: Record<string, unknown>;
+}
+
+interface LearnedPattern {
+  id: string;
+  type: string;
+  content: Record<string, unknown>;
+  frequency: number;
+  confidence: number;
+  contexts: string[];
+  examples: Array<{ code: string }>;
+}
+
+interface CodebaseAnalysisResult {
+  languages: string[];
+  frameworks: string[];
+  complexity?: {
+    cyclomatic: number;
+    cognitive: number;
+    lines?: number;
+  };
+  entryPoints?: Array<{
+    type: string;
+    filePath: string;
+    description?: string;
+    framework?: string;
+  }>;
+  keyDirectories?: KeyDirectoryInfo[];
+}
+
+interface KeyDirectoryInfo {
+  type: string;
+  path?: string;
+  fileCount?: number;
+  description?: string;
+}
+
 export interface LearningResult {
   success: boolean;
   conceptsLearned: number;
@@ -267,9 +313,9 @@ export class LearningService {
 
   private static async storeIntelligence(
     database: SQLiteDatabase,
-    path: string,
-    concepts: any[],
-    patterns: any[]
+    _path: string,
+    concepts: LearnedConcept[],
+    patterns: LearnedPattern[]
   ): Promise<void> {
     // Store concepts
     for (const concept of concepts) {
@@ -280,7 +326,7 @@ export class LearningService {
         confidenceScore: concept.confidence,
         relationships: concept.relationships,
         evolutionHistory: {},
-        filePath: concept.filePath,
+        filePath: concept.filePath || concept.file_path || 'unknown',
         lineRange: concept.lineRange
       });
     }
@@ -300,8 +346,8 @@ export class LearningService {
   }
 
   private static async analyzeCodebaseRelationships(
-    concepts: any[],
-    patterns: any[]
+    concepts: LearnedConcept[],
+    patterns: LearnedPattern[]
   ): Promise<{ conceptRelationships: number; dependencyPatterns: number }> {
     const conceptRelationships = new Set<string>();
 
@@ -311,7 +357,7 @@ export class LearningService {
       if (!acc[filePath]) acc[filePath] = [];
       acc[filePath].push(concept);
       return acc;
-    }, {} as Record<string, any[]>);
+    }, {} as Record<string, LearnedConcept[]>);
 
     // Find relationships within files
     Object.values(conceptsByFile).forEach(fileConcepts => {
@@ -343,9 +389,9 @@ export class LearningService {
   }
 
   private static async generateLearningInsights(
-    concepts: any[],
-    patterns: any[],
-    codebaseAnalysis: any
+    concepts: LearnedConcept[],
+    patterns: LearnedPattern[],
+    codebaseAnalysis: CodebaseAnalysisResult
   ): Promise<string[]> {
     const insights: string[] = [];
 
@@ -402,8 +448,8 @@ export class LearningService {
 
   private static async buildSemanticIndex(
     vectorDB: SemanticVectorDB,
-    concepts: any[],
-    patterns: any[]
+    concepts: LearnedConcept[],
+    patterns: LearnedPattern[]
   ): Promise<number> {
     try {
       await vectorDB.initialize('in-memoria-intelligence');
@@ -416,7 +462,7 @@ export class LearningService {
         const text = `${concept.name} ${conceptType}`;
         await vectorDB.storeCodeEmbedding(text, {
           id: concept.id,
-          filePath: concept.filePath,
+          filePath: concept.filePath || concept.file_path || 'unknown',
           functionName: conceptType === 'function' ? concept.name : undefined,
           className: conceptType === 'class' ? concept.name : undefined,
           language: 'unknown',
@@ -451,7 +497,7 @@ export class LearningService {
 
   private static async storeProjectBlueprint(
     projectPath: string,
-    codebaseAnalysis: any,
+    codebaseAnalysis: CodebaseAnalysisResult,
     database: SQLiteDatabase
   ): Promise<void> {
     // Debug logging to track what's being received
@@ -518,7 +564,7 @@ export class LearningService {
     // }
   }
 
-  private static inferArchitecturePattern(codebaseAnalysis: any): string {
+  private static inferArchitecturePattern(codebaseAnalysis: CodebaseAnalysisResult): string {
     const frameworks = codebaseAnalysis?.frameworks || [];
     const directories = codebaseAnalysis?.keyDirectories || [];
 
@@ -528,11 +574,11 @@ export class LearningService {
       return 'REST API (Express)';
     } else if (frameworks.some((f: string) => f.toLowerCase().includes('fastapi'))) {
       return 'REST API (FastAPI)';
-    } else if (directories.some((d: any) => d.type === 'services')) {
+    } else if (directories.some((d: KeyDirectoryInfo) => d.type === 'services')) {
       return 'Service-Oriented';
-    } else if (directories.some((d: any) => d.type === 'components')) {
+    } else if (directories.some((d: KeyDirectoryInfo) => d.type === 'components')) {
       return 'Component-Based';
-    } else if (directories.some((d: any) => d.type === 'models' && d.type === 'views')) {
+    } else if (directories.some((d: KeyDirectoryInfo) => d.type === 'models') && directories.some((d: KeyDirectoryInfo) => d.type === 'views')) {
       return 'MVC Pattern';
     } else {
       return 'Modular';

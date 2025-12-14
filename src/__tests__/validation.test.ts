@@ -210,7 +210,7 @@ describe('Input Validation', () => {
     });
 
     it('should have working schemas for all tools', () => {
-      Object.entries(VALIDATION_SCHEMAS).forEach(([toolName, schema]) => {
+      Object.entries(VALIDATION_SCHEMAS).forEach(([_toolName, schema]) => {
         expect(typeof schema.parse).toBe('function');
         
         // Try to parse empty object (should either work with defaults or fail gracefully)

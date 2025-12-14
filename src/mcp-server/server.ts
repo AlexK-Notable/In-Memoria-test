@@ -18,6 +18,7 @@ import { SemanticVectorDB } from '../storage/vector-db.js';
 import { validateInput, VALIDATION_SCHEMAS } from './validation.js';
 import { config } from '../config/config.js';
 import { Logger } from '../utils/logger.js';
+import { shutdownManager } from '../utils/shutdown-manager.js';
 
 export class CodeCartographerMCP {
   private server: Server;
@@ -52,7 +53,6 @@ export class CodeCartographerMCP {
 
       // Initialize storage using configuration management
       // Database path is determined by config based on the analyzed project
-      const appConfig = config.getConfig();
       const dbPath = config.getDatabasePath(); // Will use current directory as project path
       Logger.info(`Attempting to initialize database at: ${dbPath}`);
 
@@ -286,16 +286,13 @@ export class CodeCartographerMCP {
 export async function runServer(): Promise<void> {
   const server = new CodeCartographerMCP();
 
-  // Handle graceful shutdown
-  process.on('SIGINT', async () => {
+  // Register cleanup handlers with ShutdownManager
+  shutdownManager.register('MCP Server', async () => {
     await server.stop();
-    process.exit(0);
-  });
+  }, 10); // High priority - stop server first
 
-  process.on('SIGTERM', async () => {
-    await server.stop();
-    process.exit(0);
-  });
+  // Install signal handlers via ShutdownManager
+  shutdownManager.installSignalHandlers();
 
   await server.start();
 }

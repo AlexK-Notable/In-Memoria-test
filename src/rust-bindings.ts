@@ -1,7 +1,5 @@
 // Platform-specific binary loading
 import { createRequire } from 'module';
-import { join } from 'path';
-import { fileURLToPath } from 'url';
 
 const require = createRequire(import.meta.url);
 

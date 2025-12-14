@@ -1,9 +1,7 @@
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import {
-  CodebaseAnalysisSchema,
   SearchQuerySchema,
   DocOptionsSchema,
-  type CodebaseAnalysis,
   type SearchQuery,
   type DocOptions
 } from '../types.js';
@@ -14,7 +12,135 @@ import { readFileSync, statSync, readdirSync, lstatSync } from 'fs';
 import { join, relative, extname, basename } from 'path';
 import { detectLanguageFromPath } from '../../utils/language-registry.js';
 import { glob } from 'glob';
-import { ErrorFactory, MCPErrorUtils, ErrorUtils, InMemoriaError, MCPErrorCode } from '../../utils/error-types.js';
+import { ErrorUtils, InMemoriaError } from '../../utils/error-types.js';
+import type { SQLiteDatabase } from '../../storage/sqlite-db.js';
+import type { AnalyzedConcept, FileMetadata } from '../../types/index.js';
+
+interface DirectoryNode {
+  name: string;
+  path: string;
+  type: 'file' | 'directory';
+  children?: DirectoryNode[];
+  metadata?: FileMetadata;
+}
+
+interface DirectoryStructureNode {
+  name: string;
+  type: 'file' | 'directory';
+  path: string;
+  size?: number;
+  language?: string;
+  lastModified?: Date;
+  children?: DirectoryStructureNode[];
+}
+
+interface InternalSearchResult {
+  file: string;
+  content: string;
+  score: number;
+  context: string;
+  metadata?: Record<string, unknown>;
+  lineNumber?: number;
+}
+
+interface SearchResponse {
+  results: InternalSearchResult[];
+  totalFound: number;
+  searchType: string;
+  error?: string;
+}
+
+interface CodebaseAnalysisResult {
+  languages: string[];
+  frameworks: string[];
+  complexity?: {
+    cyclomatic: number;
+    cognitive: number;
+    lines?: number;
+  };
+  concepts: Array<{
+    name: string;
+    type: string;
+    confidence: number;
+  }>;
+}
+
+interface SemanticConceptResult {
+  id: string;
+  name: string;
+  type: string;
+  confidence: number;
+  filePath: string;
+  lineRange: { start: number; end: number };
+  relationships: Record<string, unknown>;
+}
+
+interface PatternResult {
+  id?: string;
+  type: string;
+  description?: string;
+  content?: Record<string, unknown>;
+  frequency: number;
+  confidence?: number;
+  contexts?: string[];
+  examples?: Array<{ code: string } | string>;
+}
+
+interface PatternInsight {
+  patternType?: string;
+  confidence?: number;
+  frequency?: number;
+}
+
+interface DocumentationAnalysis {
+  path: string;
+  codebaseAnalysis: CodebaseAnalysisResult;
+  semanticConcepts: SemanticConceptResult[];
+  patterns: PatternResult[];
+  patternInsights: PatternInsight[];
+  analysisTimestamp: Date;
+  analysisStatus?: string;
+  errors?: string[];
+}
+
+interface ConceptInfo {
+  name: string;
+  type: string;
+  confidence: number;
+  line?: number;
+}
+
+interface PatternInfo {
+  type: string;
+  description: string;
+  frequency: number;
+}
+
+interface AnalyzeCodebaseResult {
+  type?: 'file' | 'codebase';
+  path: string;
+  language?: string;
+  languages?: string[];
+  lineCount?: number;
+  size?: number;
+  concepts?: ConceptInfo[];
+  patterns?: PatternInfo[];
+  topConcepts?: ConceptInfo[];
+  topPatterns?: PatternInfo[];
+  complexity?: {
+    cyclomatic: number;
+    cognitive: number;
+    lines?: number;
+  };
+  frameworks?: string[];
+  summary?: {
+    totalConcepts: number;
+    totalPatterns: number;
+    note: string;
+  };
+  note?: string;
+  error?: string;
+}
 
 export class CoreAnalysisTools {
   private intelligenceTools: IntelligenceTools;
@@ -22,7 +148,7 @@ export class CoreAnalysisTools {
   constructor(
     private semanticEngine: SemanticEngine,
     private patternEngine: PatternEngine,
-    private database: any
+    database: SQLiteDatabase
   ) {
     this.intelligenceTools = new IntelligenceTools(semanticEngine, patternEngine, database);
   }
@@ -111,7 +237,7 @@ export class CoreAnalysisTools {
     ];
   }
 
-  async analyzeCodebase(args: { path: string }): Promise<any> {
+  async analyzeCodebase(args: { path: string }): Promise<AnalyzeCodebaseResult> {
     // Input validation
     if (!args.path || typeof args.path !== 'string') {
       throw new Error('Path parameter is required and must be a string');
@@ -145,17 +271,18 @@ export class CoreAnalysisTools {
           lineCount,
           size: stats.size,
           // Token-efficient: Top 10 concepts only
-          concepts: semanticConcepts.slice(0, 10).map((c: any) => ({
+          concepts: semanticConcepts.slice(0, 10).map((c) => ({
             name: c.name,
             type: c.type,
             confidence: c.confidence,
             line: c.lineRange?.start || 0
           })),
           // Token-efficient: Top 5 patterns
-          patterns: patterns.slice(0, 5).map((p: any) => ({
+          patterns: patterns.slice(0, 5).map((p) => ({
             type: p.type,
             description: p.description,
-            frequency: p.frequency || 1
+            frequency: 1, // File patterns don't have frequency, use default
+            confidence: p.confidence
           })),
           complexity: {
             cyclomatic: complexity.cyclomatic,
@@ -176,13 +303,13 @@ export class CoreAnalysisTools {
           frameworks: analysis.frameworks,
           complexity: analysis.complexity,
           // Token-efficient: Top 15 concepts only
-          topConcepts: analysis.concepts.slice(0, 15).map((concept: any) => ({
+          topConcepts: analysis.concepts.slice(0, 15).map((concept) => ({
             name: concept.name,
             type: concept.type,
             confidence: concept.confidence
           })),
           // Token-efficient: Top 10 patterns only
-          topPatterns: patterns.slice(0, 10).map((p: any) => ({
+          topPatterns: patterns.slice(0, 10).map((p) => ({
             type: p.type,
             description: p.description,
             frequency: p.frequency
@@ -299,7 +426,7 @@ export class CoreAnalysisTools {
   }
 
   async getProjectStructure(args: { path: string; maxDepth?: number }): Promise<{
-    structure: any;
+    structure: DirectoryNode | null;
     summary: {
       totalFiles: number;
       languages: Record<string, number>;
@@ -373,7 +500,7 @@ export class CoreAnalysisTools {
     return detectLanguageFromPath(filePath);
   }
 
-  private calculateDetailedComplexity(content: string, semanticConcepts: any[]): {
+  private calculateDetailedComplexity(content: string, semanticConcepts: AnalyzedConcept[]): {
     cyclomatic: number;
     cognitive: number;
     functions: number;
@@ -521,50 +648,14 @@ export class CoreAnalysisTools {
     return exports.slice(0, 20); // Limit to prevent overwhelming output
   }
 
-  private calculateMaintainabilityIndex(complexity: any): number {
-    // Simplified maintainability index calculation
-    const volume = Math.log2(complexity.lines || 1);
-    const cyclomaticComplexity = complexity.cyclomatic || 1;
-    const linesOfCode = complexity.lines || 1;
-
-    // Microsoft maintainability index formula (simplified)
-    const maintainabilityIndex = Math.max(0,
-      171 - 5.2 * Math.log(volume) - 0.23 * cyclomaticComplexity - 16.2 * Math.log(linesOfCode)
-    );
-
-    return Math.round(maintainabilityIndex);
-  }
-
-  private assessTechnicalDebt(patterns: any[]): string {
-    const violationPatterns = patterns.filter(p =>
-      p.pattern_type?.includes('violation') ||
-      p.description?.includes('anti-pattern') ||
-      p.confidence < 0.5
-    );
-
-    const debtScore = violationPatterns.length;
-
-    if (debtScore === 0) return 'low';
-    if (debtScore <= 3) return 'medium';
-    return 'high';
-  }
-
-  private async buildDirectoryStructure(path: string, maxDepth: number, currentDepth = 0): Promise<{
-    name: string;
-    type: 'file' | 'directory';
-    path: string;
-    size?: number;
-    language?: string;
-    lastModified?: Date;
-    children?: Array<any>;
-  }> {
+  private async buildDirectoryStructure(path: string, maxDepth: number, currentDepth = 0): Promise<DirectoryStructureNode | null> {
     try {
       const stats = lstatSync(path);
       const name = basename(path);
 
       // Skip common ignored directories (but not for root directory)
       if (currentDepth > 0 && this.shouldIgnoreDirectory(name)) {
-        return null as any;
+        return null;
       }
 
       if (stats.isFile()) {
@@ -581,7 +672,7 @@ export class CoreAnalysisTools {
       }
 
       if (stats.isDirectory() && currentDepth < maxDepth) {
-        const children: Array<any> = [];
+        const children: DirectoryStructureNode[] = [];
 
         try {
           const entries = readdirSync(path);
@@ -615,10 +706,10 @@ export class CoreAnalysisTools {
         };
       }
 
-      return null as any;
+      return null;
     } catch (error) {
       // Skip files/directories we can't access
-      return null as any;
+      return null;
     }
   }
 
@@ -635,7 +726,7 @@ export class CoreAnalysisTools {
     return ignoredDirs.includes(name) || name.startsWith('.');
   }
 
-  private calculateStructureSummary(structure: any): {
+  private calculateStructureSummary(structure: DirectoryStructureNode | null): {
     totalFiles: number;
     languages: Record<string, number>;
     directories: number;
@@ -658,7 +749,7 @@ export class CoreAnalysisTools {
 
     const allFiles: Array<{ name: string; size: number; path: string; lastModified: Date; language: string }> = [];
 
-    const traverse = (node: any) => {
+    const traverse = (node: DirectoryStructureNode | null) => {
       if (!node) return;
 
       if (node.type === 'directory') {
@@ -717,7 +808,7 @@ export class CoreAnalysisTools {
     return summary;
   }
 
-  private async semanticSearch(query: SearchQuery): Promise<any> {
+  private async semanticSearch(query: SearchQuery): Promise<SearchResponse> {
     try {
       // Get the vector database from semantic engine
       const vectorResults = await this.semanticEngine.searchSemanticallySimilar(
@@ -771,7 +862,7 @@ export class CoreAnalysisTools {
     }
   }
 
-  private async patternSearch(query: SearchQuery): Promise<any> {
+  private async patternSearch(query: SearchQuery): Promise<SearchResponse> {
     try {
       // Search for patterns using the pattern engine
       const relevantPatterns = await this.patternEngine.findRelevantPatterns(
@@ -853,7 +944,7 @@ export class CoreAnalysisTools {
     }
   }
 
-  private async textSearch(query: SearchQuery): Promise<any> {
+  private async textSearch(query: SearchQuery): Promise<SearchResponse> {
     try {
       const searchPattern = query.language ?
         `**/*.{${this.getFileExtensionsForLanguage(query.language)}}` :
@@ -1073,7 +1164,7 @@ export class CoreAnalysisTools {
     }
   }
 
-  private async buildIntelligentDocumentation(analysis: any, options: DocOptions): Promise<string> {
+  private async buildIntelligentDocumentation(analysis: DocumentationAnalysis, options: DocOptions): Promise<string> {
     const sections: string[] = [];
 
     // Header with intelligence badge
@@ -1135,279 +1226,9 @@ export class CoreAnalysisTools {
     return sections.join('\n');
   }
 
-  private async generateOverview(analysis: CodebaseAnalysis): Promise<string> {
-    const lines = [
-      `This documentation provides an intelligent analysis of the **${analysis.path || 'codebase'}**.`,
-      '',
-      '### Language Distribution',
-      ''
-    ];
+  // Intelligent documentation generation methods using real data
 
-    // Language breakdown
-    if (analysis.languages && analysis.languages.length > 0) {
-      for (const lang of analysis.languages) {
-        lines.push(`- **${lang}**: Detected in codebase`);
-      }
-    } else {
-      lines.push('- Languages detected through file analysis');
-    }
-
-    lines.push('');
-    lines.push('### Key Metrics');
-    if (analysis.complexity) {
-      lines.push(`- **Cyclomatic Complexity**: ${analysis.complexity.cyclomatic || 'N/A'}`);
-      lines.push(`- **Cognitive Complexity**: ${analysis.complexity.cognitive || 'N/A'}`);
-      lines.push(`- **Total Lines**: ${analysis.complexity.lines || 'N/A'}`);
-    } else {
-      lines.push('- Complexity metrics will be calculated during analysis');
-    }
-
-    // Add architectural insights based on patterns
-    if (analysis.patterns && analysis.patterns.length > 0) {
-      const hasComponents = analysis.patterns.some(p => p.type?.includes('component'));
-      const hasServices = analysis.patterns.some(p => p.type?.includes('service'));
-      const hasUtils = analysis.patterns.some(p => p.type?.includes('util'));
-
-      if (hasComponents || hasServices || hasUtils) {
-        lines.push('');
-        lines.push('### Architecture Style');
-        if (hasComponents) lines.push('- Component-based architecture detected');
-        if (hasServices) lines.push('- Service-oriented patterns found');
-        if (hasUtils) lines.push('- Utility-driven organization identified');
-      }
-    }
-
-    return lines.join('\n');
-  }
-
-  private async generateArchitectureSection(analysis: CodebaseAnalysis): Promise<string> {
-    const lines = [
-      'This section describes the architectural patterns and structure of the codebase.',
-      ''
-    ];
-
-    // Directory structure insights
-    if (analysis.patterns && analysis.patterns.length > 0) {
-      const structuralPatterns = analysis.patterns.filter(p =>
-        p.type?.includes('structure') || p.type?.includes('organization'));
-
-      if (structuralPatterns.length > 0) {
-        lines.push('### Structural Organization');
-        lines.push('');
-        for (const pattern of structuralPatterns.slice(0, 5)) {
-          const patternName = pattern.type?.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) || 'Pattern';
-          lines.push(`- **${patternName}**: ${pattern.description || 'Structural pattern detected'}`);
-        }
-        lines.push('');
-      }
-
-      // Design patterns
-      const designPatterns = analysis.patterns.filter(p =>
-        p.type?.includes('implementation') || p.type?.includes('pattern'));
-
-      if (designPatterns.length > 0) {
-        lines.push('### Design Patterns');
-        lines.push('');
-        for (const pattern of designPatterns.slice(0, 5)) {
-          const patternName = pattern.type?.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) || 'Pattern';
-          lines.push(`- **${patternName}**: ${pattern.description || 'Design pattern detected'}`);
-        }
-        lines.push('');
-      }
-    } else {
-      lines.push('### Architecture Analysis');
-      lines.push('');
-      lines.push('*Architecture patterns will be identified through detailed code analysis.*');
-      lines.push('');
-    }
-
-    return lines.join('\n');
-  }
-
-  private async generatePatternsSection(analysis: CodebaseAnalysis): Promise<string> {
-    const lines = [
-      'This section analyzes the coding patterns and conventions used throughout the codebase.',
-      ''
-    ];
-
-    // Group patterns by category
-    const patternsByCategory: Record<string, any[]> = {};
-    for (const pattern of analysis.patterns) {
-      const category = pattern.type.split('_')[0];
-      if (!patternsByCategory[category]) patternsByCategory[category] = [];
-      patternsByCategory[category].push(pattern);
-    }
-
-    // Naming patterns
-    if (patternsByCategory.naming) {
-      lines.push('### Naming Conventions');
-      lines.push('');
-      for (const pattern of patternsByCategory.naming) {
-        const confidence = (pattern.confidence * 100).toFixed(0);
-        lines.push(`- **${pattern.type.replace(/naming_/, '').replace(/_/g, ' ')}**: ${pattern.description} (${confidence}% consistency)`);
-      }
-      lines.push('');
-    }
-
-    // Implementation patterns
-    if (patternsByCategory.implementation) {
-      lines.push('### Implementation Patterns');
-      lines.push('');
-      for (const pattern of patternsByCategory.implementation) {
-        const confidence = (pattern.confidence * 100).toFixed(0);
-        lines.push(`- **${pattern.type.replace(/implementation_/, '').replace(/_/g, ' ')}**: ${pattern.description}`);
-        lines.push(`  - Usage confidence: ${confidence}%`);
-      }
-      lines.push('');
-    }
-
-    // Dependency patterns
-    if (patternsByCategory.dependency) {
-      lines.push('### Dependency Patterns');
-      lines.push('');
-      for (const pattern of patternsByCategory.dependency) {
-        lines.push(`- **${pattern.type.replace(/dependency_/, '').replace(/_/g, ' ')}**: ${pattern.description}`);
-      }
-      lines.push('');
-    }
-
-    // Pattern recommendations
-    lines.push('### Pattern Recommendations');
-    lines.push('');
-    if (analysis.patterns.length > 10) {
-      lines.push('✅ **Strong pattern consistency** - The codebase shows consistent use of established patterns.');
-    } else if (analysis.patterns.length > 5) {
-      lines.push('⚠️ **Moderate pattern usage** - Consider establishing more consistent patterns for better maintainability.');
-    } else {
-      lines.push('🔴 **Limited pattern detection** - Consider implementing more structured coding patterns.');
-    }
-
-    return lines.join('\n');
-  }
-
-  private async generateConceptsSection(analysis: CodebaseAnalysis): Promise<string> {
-    const lines = [
-      'This section provides an overview of the semantic concepts identified in the codebase.',
-      ''
-    ];
-
-    if (analysis.concepts && analysis.concepts.length > 0) {
-      // Group by type
-      const conceptsByType: Record<string, any[]> = {};
-      for (const concept of analysis.concepts) {
-        const type = concept.type || 'unknown';
-        if (!conceptsByType[type]) conceptsByType[type] = [];
-        conceptsByType[type].push(concept);
-      }
-
-      lines.push('### Concept Distribution');
-      lines.push('');
-      for (const [type, concepts] of Object.entries(conceptsByType)) {
-        lines.push(`- **${type.charAt(0).toUpperCase() + type.slice(1)}s**: ${concepts.length} identified`);
-      }
-      lines.push('');
-
-      // High-confidence concepts
-      const highConfidenceConcepts = analysis.concepts
-        .filter(c => (c.confidence || 0) > 0.8)
-        .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
-        .slice(0, 10);
-
-      if (highConfidenceConcepts.length > 0) {
-        lines.push('### Key Concepts (High Confidence)');
-        lines.push('');
-        for (const concept of highConfidenceConcepts) {
-          const confidence = ((concept.confidence || 0) * 100).toFixed(0);
-          lines.push(`- **${concept.name}** (${concept.type}) - ${confidence}% confidence`);
-        }
-        lines.push('');
-      }
-    } else {
-      lines.push('*Semantic concepts will be extracted through detailed code analysis.*');
-      lines.push('');
-    }
-
-    return lines.join('\n');
-  }
-
-  private async generateComplexitySection(analysis: CodebaseAnalysis): Promise<string> {
-    const lines = [
-      'This section analyzes the complexity characteristics of the codebase.',
-      ''
-    ];
-
-    if (analysis.complexity) {
-      lines.push('### Overall Complexity Metrics');
-      lines.push(`- **Cyclomatic Complexity**: ${analysis.complexity.cyclomatic || 'N/A'}`);
-      lines.push(`- **Cognitive Complexity**: ${analysis.complexity.cognitive || 'N/A'}`);
-      lines.push(`- **Total Lines**: ${analysis.complexity.lines || 'N/A'}`);
-      lines.push('');
-
-      // Simple recommendations based on available data
-      lines.push('### Complexity Assessment');
-      const cyclomaticComplexity = analysis.complexity.cyclomatic || 0;
-      if (cyclomaticComplexity < 10) {
-        lines.push('✅ **Low complexity** - The codebase maintains good simplicity and readability.');
-      } else if (cyclomaticComplexity < 30) {
-        lines.push('⚠️ **Moderate complexity** - Consider refactoring the most complex functions and classes.');
-      } else {
-        lines.push('🔴 **High complexity** - Priority refactoring recommended to improve maintainability.');
-      }
-    } else {
-      lines.push('### Complexity Analysis');
-      lines.push('*Complexity metrics will be calculated during detailed code analysis.*');
-    }
-
-    return lines.join('\n');
-  }
-
-  private async generateDependenciesSection(analysis: CodebaseAnalysis): Promise<string> {
-    const lines = [
-      'This section analyzes the dependency structure and relationships within the codebase.',
-      ''
-    ];
-
-    lines.push('### Dependency Analysis');
-    lines.push('*Dependency analysis will be performed during detailed code scanning.*');
-    lines.push('');
-    lines.push('**Typical analysis includes:**');
-    lines.push('- External package dependencies');
-    lines.push('- Internal module relationships');
-    lines.push('- Dependency coupling metrics');
-    lines.push('- Potential circular dependencies');
-
-    return lines.join('\n');
-  }
-
-  private async generateUsageExamples(analysis: CodebaseAnalysis): Promise<string> {
-    const lines = [
-      'This section provides usage examples based on the identified patterns and concepts.',
-      ''
-    ];
-
-    lines.push('### Usage Examples');
-    lines.push('*Usage examples will be generated based on detected patterns and entry points.*');
-    lines.push('');
-
-    if (analysis.patterns && analysis.patterns.length > 0) {
-      lines.push('**Detected Patterns:**');
-      for (const pattern of analysis.patterns.slice(0, 3)) {
-        const patternName = pattern.type?.replace(/_/g, ' ') || 'Pattern';
-        lines.push(`- ${patternName}: ${pattern.description || 'Pattern detected'}`);
-      }
-    } else {
-      lines.push('**Pattern-Based Examples:**');
-      lines.push('- Examples will be provided based on code analysis');
-      lines.push('- Usage patterns will be identified automatically');
-      lines.push('- Common architectural patterns will be documented');
-    }
-
-    return lines.join('\n');
-  }
-
-  // New intelligent documentation generation methods using real data
-
-  private async generateIntelligentOverview(analysis: any): Promise<string> {
+  private async generateIntelligentOverview(analysis: DocumentationAnalysis): Promise<string> {
     const lines = [
       `This codebase has been analyzed using semantic analysis and pattern recognition.`,
       '# Intelligent Code Analysis',
@@ -1448,7 +1269,7 @@ export class CoreAnalysisTools {
     return lines.join('\n');
   }
 
-  private async generateArchitectureIntelligence(analysis: any): Promise<string> {
+  private async generateArchitectureIntelligence(analysis: DocumentationAnalysis): Promise<string> {
     const lines = [
       'Architectural analysis reveals the following patterns and structures:',
       '## Architecture Intelligence',
@@ -1456,9 +1277,10 @@ export class CoreAnalysisTools {
     ];
 
     // Analyze patterns for architectural insights
-    const structuralPatterns = analysis.patterns.filter((p: any) =>
+    type PatternItem = DocumentationAnalysis['patterns'][number];
+    const structuralPatterns = analysis.patterns.filter((p: PatternItem) =>
       p.type?.includes('structure') || p.type?.includes('organization'));
-    const implementationPatterns = analysis.patterns.filter((p: any) =>
+    const implementationPatterns = analysis.patterns.filter((p: PatternItem) =>
       p.type?.includes('implementation'));
 
     if (structuralPatterns.length > 0) {
@@ -1494,7 +1316,7 @@ export class CoreAnalysisTools {
     return lines.join('\n');
   }
 
-  private async generateDiscoveredPatterns(analysis: any): Promise<string> {
+  private async generateDiscoveredPatterns(analysis: DocumentationAnalysis): Promise<string> {
     const lines = [
       'Advanced pattern recognition has identified the following coding patterns:',
       ''
@@ -1552,7 +1374,7 @@ export class CoreAnalysisTools {
     return lines.join('\n');
   }
 
-  private async generateSemanticConcepts(analysis: any): Promise<string> {
+  private async generateSemanticConcepts(analysis: DocumentationAnalysis): Promise<string> {
     const lines = [
       'Semantic analysis using tree-sitter has extracted the following concepts:',
       ''
@@ -1579,9 +1401,10 @@ export class CoreAnalysisTools {
     lines.push('');
 
     // High-confidence concepts
+    type ConceptItem = DocumentationAnalysis['semanticConcepts'][number];
     const highConfidenceConcepts = analysis.semanticConcepts
-      .filter((c: any) => (c.confidence || 0) > 0.8)
-      .sort((a: any, b: any) => (b.confidence || 0) - (a.confidence || 0))
+      .filter((c: ConceptItem) => (c.confidence || 0) > 0.8)
+      .sort((a: ConceptItem, b: ConceptItem) => (b.confidence || 0) - (a.confidence || 0))
       .slice(0, 10);
 
     if (highConfidenceConcepts.length > 0) {
@@ -1596,8 +1419,8 @@ export class CoreAnalysisTools {
     }
 
     // Concept relationships
-    const conceptsWithRelationships = analysis.semanticConcepts.filter((c: any) =>
-      c.relationships && Object.keys(c.relationships).length > 0);
+    const conceptsWithRelationships = analysis.semanticConcepts.filter((c: ConceptItem) =>
+      c.relationships && typeof c.relationships === 'object' && !Array.isArray(c.relationships) && Object.keys(c.relationships).length > 0);
 
     if (conceptsWithRelationships.length > 0) {
       lines.push('### 🔗 Concept Relationships (AI-Mapped)');
@@ -1611,7 +1434,7 @@ export class CoreAnalysisTools {
     return lines.join('\n');
   }
 
-  private async generateComplexityIntelligence(analysis: any): Promise<string> {
+  private async generateComplexityIntelligence(analysis: DocumentationAnalysis): Promise<string> {
     const lines = [
       'Complexity analysis provides the following insights:',
       '## Intelligent Complexity Assessment',
@@ -1649,7 +1472,7 @@ export class CoreAnalysisTools {
 
       // Concept-based complexity insights
       if (analysis.semanticConcepts.length > 0) {
-        const avgConceptsPerComplexity = analysis.semanticConcepts.length / (complexity.lines / 100);
+        const avgConceptsPerComplexity = analysis.semanticConcepts.length / ((complexity.lines || 100) / 100);
         lines.push('');
         lines.push('### 🧠 Semantic Complexity Ratio');
         lines.push(`- **Concept density**: ${avgConceptsPerComplexity.toFixed(2)} concepts per 100 lines`);
@@ -1669,7 +1492,7 @@ export class CoreAnalysisTools {
     return lines.join('\n');
   }
 
-  private async generateRealIntelligentInsights(analysis: any): Promise<string> {
+  private async generateRealIntelligentInsights(analysis: DocumentationAnalysis): Promise<string> {
     try {
       const lines = [
         'Real-time intelligent insights generated from learned patterns and semantic analysis:',
@@ -1753,7 +1576,7 @@ export class CoreAnalysisTools {
     }
   }
 
-  private async generateIntelligentExamples(analysis: any): Promise<string> {
+  private async generateIntelligentExamples(analysis: DocumentationAnalysis): Promise<string> {
     try {
       const lines = [
         'Intelligent usage examples generated from real pattern analysis:',

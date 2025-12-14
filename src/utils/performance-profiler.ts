@@ -242,7 +242,7 @@ export const globalProfiler = new PerformanceProfiler();
 /**
  * Decorator for timing class methods
  */
-export function timed(target: any, propertyKey: string, descriptor: PropertyDescriptor) {
+export function timed(_target: any, propertyKey: string, descriptor: PropertyDescriptor) {
   const originalMethod = descriptor.value;
 
   descriptor.value = function(...args: any[]) {

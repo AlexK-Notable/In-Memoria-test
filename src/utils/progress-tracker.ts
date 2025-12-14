@@ -23,7 +23,6 @@ export interface ProgressPhase {
 export class ProgressTracker extends EventEmitter {
   private phases: Map<string, ProgressPhase> = new Map();
   private startTime: number;
-  private currentPhase?: string;
   private totalWeight: number = 0;
 
   constructor() {
@@ -48,7 +47,6 @@ export class ProgressTracker extends EventEmitter {
     }
     const phase = this.phases.get(phaseName)!;
     phase.started = true;
-    this.currentPhase = phaseName;
     this.emit('phaseStart', phaseName);
     this.emitProgress(phaseName, 0);
   }
@@ -201,7 +199,6 @@ export class ProgressTracker extends EventEmitter {
       phase.current = 0;
     }
     this.startTime = Date.now();
-    this.currentPhase = undefined;
   }
 
   // Console progress bar visualization
@@ -263,7 +260,7 @@ export class ProgressTracker extends EventEmitter {
     }
 
     // Show ALL phases from the start to maintain fixed layout
-    for (const [name, phase] of this.phases) {
+    for (const [name, _phase] of this.phases) {
       lines.push(this.renderProgressBar(name));
     }
 

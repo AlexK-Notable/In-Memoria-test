@@ -211,8 +211,9 @@ export class DebugTools {
 
       const database = new SQLiteDatabase(dbPath);
       const vectorDB = new SemanticVectorDB(process.env.OPENAI_API_KEY);
-      const semanticEngine = new SemanticEngine(database, vectorDB);
-      const patternEngine = new PatternEngine(database);
+      // Initialize engines to verify they can be created successfully
+      new SemanticEngine(database, vectorDB);
+      new PatternEngine(database);
 
       console.log('  ✅ Intelligence components initialized successfully');
       results.passed++;
@@ -293,7 +294,8 @@ export class DebugTools {
         if (existsSync(configFile)) {
           console.log('  ⚙️  Configuration file exists');
           try {
-            const configContent = await import(`file://${configFile}`);
+            // Import to verify JSON is valid (result not needed)
+            await import(`file://${configFile}`);
             console.log('  ✅ Configuration file is valid JSON');
             results.passed++;
           } catch (error) {

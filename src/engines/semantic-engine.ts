@@ -1,10 +1,47 @@
 import { SemanticAnalyzer, BlueprintAnalyzer, FrameworkDetector } from '../rust-bindings.js';
-import { SQLiteDatabase, SemanticConcept } from '../storage/sqlite-db.js';
+import { SQLiteDatabase } from '../storage/sqlite-db.js';
 import { SemanticVectorDB } from '../storage/vector-db.js';
 import { nanoid } from 'nanoid';
 import { CircuitBreaker, createRustAnalyzerCircuitBreaker } from '../utils/circuit-breaker.js';
-import { globalProfiler, PerformanceOptimizer } from '../utils/performance-profiler.js';
+import { globalProfiler } from '../utils/performance-profiler.js';
 import { detectLanguageFromPath as resolveLanguageFromPath } from '../utils/language-registry.js';
+
+// Local types for Rust binding results
+interface RustConceptResult {
+  id?: string;
+  name: string;
+  conceptType: string;
+  confidence: number;
+  filePath?: string;
+  lineRange: { start: number; end: number };
+  relationships?: Record<string, unknown>;
+}
+
+interface RustEntryPointResult {
+  entryType?: string;
+  entry_type?: string;
+  filePath?: string;
+  file_path?: string;
+  framework?: string;
+}
+
+interface RustKeyDirectoryResult {
+  path: string;
+  dirType?: string;
+  dir_type?: string;
+  fileCount?: number;
+  file_count?: number;
+}
+
+interface AnalysisUpdateData {
+  change?: {
+    type: string;
+  };
+  impact?: {
+    affectedConcepts?: string[];
+    confidence?: number;
+  };
+}
 
 export interface CodebaseAnalysisResult {
   languages: string[];
@@ -62,12 +99,6 @@ export class SemanticEngine {
   ) {
     this.rustCircuitBreaker = createRustAnalyzerCircuitBreaker();
 
-    // Create memoized versions of expensive operations
-    this.memoizedLanguageDetection = PerformanceOptimizer.memoize(
-      this.detectLanguageFromPath.bind(this),
-      (filePath: string) => filePath.split('.').pop() || 'unknown'
-    );
-
     // Schedule periodic cache cleanup
     this.cleanupInterval = setInterval(() => {
       this.cleanupCaches();
@@ -88,8 +119,6 @@ export class SemanticEngine {
 
     await this.initializationPromise;
   }
-
-  private memoizedLanguageDetection: (filePath: string) => string;
 
   async analyzeCodebase(path: string): Promise<CodebaseAnalysisResult> {
     return globalProfiler.timeAsync('SemanticEngine.analyzeCodebase', async () => {
@@ -114,7 +143,7 @@ export class SemanticEngine {
               cognitive: result.complexity.cognitive,
               lines: result.complexity.lines
             },
-            concepts: result.concepts.map((c: any) => ({
+            concepts: result.concepts.map((c: RustConceptResult) => ({
               name: c.name,
               type: c.conceptType,
               confidence: c.confidence
@@ -159,7 +188,7 @@ export class SemanticEngine {
       const result = await this.rustCircuitBreaker.execute(
         async () => {
           const concepts = await this.rustAnalyzer!.analyzeFileContent(filePath, content);
-          return concepts.map((c: any) => ({
+          return concepts.map((c: RustConceptResult) => ({
             name: c.name,
             type: c.conceptType,
             confidence: c.confidence,
@@ -238,7 +267,7 @@ export class SemanticEngine {
         }, progressInterval);
       });
 
-      let concepts: any[];
+      let concepts: RustConceptResult[];
       try {
         concepts = await Promise.race([
           this.rustAnalyzer!.learnFromCodebase(path),
@@ -260,17 +289,17 @@ export class SemanticEngine {
       // Store in vector database for semantic search
       await this.vectorDB.initialize();
 
-      const result = concepts.map((c: any) => ({
-        id: c.id,
+      const result = concepts.map((c: RustConceptResult) => ({
+        id: c.id || nanoid(),
         name: c.name,
         type: c.conceptType,
         confidence: c.confidence,
-        filePath: c.filePath,
+        filePath: c.filePath || 'unknown',
         lineRange: {
           start: c.lineRange.start,
           end: c.lineRange.end
         },
-        relationships: c.relationships
+        relationships: c.relationships || {}
       }));
 
       // Store concepts for persistence (with error handling and progress updates)
@@ -342,13 +371,13 @@ export class SemanticEngine {
     }
   }
 
-  async updateFromAnalysis(analysisData: any): Promise<void> {
+  async updateFromAnalysis(analysisData: AnalysisUpdateData): Promise<void> {
     try {
       // Update the Rust analyzer with new analysis data
       await this.rustAnalyzer.updateFromAnalysis(JSON.stringify(analysisData));
 
       // Update local intelligence based on the analysis
-      if (analysisData.change && analysisData.impact.affectedConcepts) {
+      if (analysisData.change && analysisData.impact?.affectedConcepts) {
         for (const conceptName of analysisData.impact.affectedConcepts) {
           const existingConcepts = this.database.getSemanticConcepts();
           const concept = existingConcepts.find(c => c.conceptName === conceptName);
@@ -362,7 +391,7 @@ export class SemanticEngine {
                 {
                   timestamp: new Date(),
                   changeType: analysisData.change.type,
-                  confidence: analysisData.impact.confidence
+                  confidence: analysisData.impact?.confidence
                 }
               ]
             };
@@ -545,9 +574,9 @@ export class SemanticEngine {
       const frameworkInfo = await FrameworkDetector.detectFrameworks(projectPath);
       const entryPoints = await BlueprintAnalyzer.detectEntryPoints(projectPath, frameworkInfo);
 
-      return entryPoints.map((ep: any) => ({
-        type: ep.entryType || ep.entry_type,  // Try camelCase first (NAPI conversion), fallback to snake_case
-        filePath: ep.filePath || ep.file_path,
+      return entryPoints.map((ep: RustEntryPointResult) => ({
+        type: ep.entryType || ep.entry_type || 'unknown',  // Try camelCase first (NAPI conversion), fallback to snake_case
+        filePath: ep.filePath || ep.file_path || 'unknown',
         framework: ep.framework || undefined,
       }));
     };
@@ -666,10 +695,10 @@ export class SemanticEngine {
     const rustImplementation = async () => {
       const keyDirs = await BlueprintAnalyzer.mapKeyDirectories(projectPath);
 
-      return keyDirs.map((dir: any) => ({
+      return keyDirs.map((dir: RustKeyDirectoryResult) => ({
         path: dir.path,
-        type: dir.dirType || dir.dir_type,  // Try camelCase first (NAPI conversion), fallback to snake_case
-        fileCount: dir.fileCount || dir.file_count,
+        type: dir.dirType || dir.dir_type || 'unknown',  // Try camelCase first (NAPI conversion), fallback to snake_case
+        fileCount: dir.fileCount || dir.file_count || 0,
       }));
     };
 

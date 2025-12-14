@@ -3,6 +3,7 @@ import { mkdirSync, existsSync } from 'fs';
 import { dirname, isAbsolute } from 'path';
 import { DatabaseMigrator } from './migrations.js';
 import { Logger } from '../utils/logger.js';
+import { escapeLikePattern } from '../utils/security.js';
 
 export interface SemanticConcept {
   id: string;
@@ -106,6 +107,125 @@ export interface ProjectDecision {
   madeAt: Date;
 }
 
+// Database row interfaces - map to snake_case column names
+interface SemanticConceptRow {
+  id: string;
+  concept_name: string;
+  concept_type: string;
+  confidence_score: number;
+  relationships: string;
+  evolution_history: string;
+  file_path: string;
+  line_range: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface DeveloperPatternRow {
+  pattern_id: string;
+  pattern_type: string;
+  pattern_content: string;
+  frequency: number;
+  contexts: string;
+  examples: string;
+  confidence: number;
+  created_at: string;
+  last_seen: string;
+}
+
+interface FileIntelligenceRow {
+  file_path: string;
+  file_hash: string;
+  semantic_concepts: string;
+  patterns_used: string;
+  complexity_metrics: string;
+  dependencies: string;
+  last_analyzed: string;
+  created_at: string;
+}
+
+interface AIInsightRow {
+  insight_id: string;
+  insight_type: string;
+  insight_content: string;
+  confidence_score: number;
+  source_agent: string;
+  validation_status: string;
+  impact_prediction: string;
+  created_at: string;
+}
+
+interface FeatureMapRow {
+  id: string;
+  project_path: string;
+  feature_name: string;
+  primary_files: string;
+  related_files: string;
+  dependencies: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface EntryPointRow {
+  id: string;
+  project_path: string;
+  entry_type: string;
+  file_path: string;
+  description: string | null;
+  framework: string | null;
+  created_at: string;
+}
+
+interface KeyDirectoryRow {
+  id: string;
+  project_path: string;
+  directory_path: string;
+  directory_type: string;
+  file_count: number;
+  description: string | null;
+  created_at: string;
+}
+
+interface WorkSessionRow {
+  id: string;
+  project_path: string;
+  session_start: string;
+  session_end: string | null;
+  last_feature: string | null;
+  current_files: string;
+  completed_tasks: string;
+  pending_tasks: string;
+  blockers: string;
+  session_notes: string | null;
+  last_updated: string;
+}
+
+interface ProjectDecisionRow {
+  id: string;
+  project_path: string;
+  decision_key: string;
+  decision_value: string;
+  reasoning: string | null;
+  made_at: string;
+}
+
+interface ProjectMetadataRow {
+  project_id: string;
+  project_path: string;
+  project_name: string | null;
+  language_primary: string | null;
+  languages_detected: string;
+  framework_detected: string;
+  intelligence_version: string | null;
+  last_full_scan: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// Type alias for query parameters
+type QueryParams = (string | number | null | boolean)[];
+
 export class SQLiteDatabase {
   private db: Database.Database;
   private migrator: DatabaseMigrator;
@@ -119,8 +239,18 @@ export class SQLiteDatabase {
         mkdirSync(dir, { recursive: true });
       }
     }
-    
+
     this.db = new Database(dbPath);
+
+    // Enable WAL mode for better crash recovery and concurrent access
+    // WAL mode provides better crash safety - incomplete transactions are rolled back on recovery
+    if (dbPath !== ':memory:') {
+      this.db.pragma('journal_mode = WAL');
+    }
+
+    // Enable foreign key constraints
+    this.db.pragma('foreign_keys = ON');
+
     this.migrator = new DatabaseMigrator(this.db);
     this.initializeDatabase();
   }
@@ -137,6 +267,103 @@ export class SQLiteDatabase {
 
   getMigrator(): DatabaseMigrator {
     return this.migrator;
+  }
+
+  /**
+   * Execute multiple operations in a single transaction.
+   * All operations succeed or all fail atomically - no partial state.
+   *
+   * @param fn Function containing database operations to execute atomically
+   * @returns The return value of the function
+   */
+  transaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)();
+  }
+
+  /**
+   * Batch insert semantic concepts in a single transaction.
+   * More efficient and atomic than individual inserts.
+   */
+  insertSemanticConceptsBatch(concepts: Omit<SemanticConcept, 'createdAt' | 'updatedAt'>[]): void {
+    if (concepts.length === 0) return;
+
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO semantic_concepts (
+        id, concept_name, concept_type, confidence_score,
+        relationships, evolution_history, file_path, line_range
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    this.transaction(() => {
+      for (const concept of concepts) {
+        stmt.run(
+          concept.id,
+          concept.conceptName,
+          concept.conceptType,
+          concept.confidenceScore,
+          JSON.stringify(concept.relationships),
+          JSON.stringify(concept.evolutionHistory),
+          concept.filePath,
+          JSON.stringify(concept.lineRange)
+        );
+      }
+    });
+  }
+
+  /**
+   * Batch insert developer patterns in a single transaction.
+   */
+  insertDeveloperPatternsBatch(patterns: Omit<DeveloperPattern, 'createdAt' | 'lastSeen'>[]): void {
+    if (patterns.length === 0) return;
+
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO developer_patterns (
+        pattern_id, pattern_type, pattern_content, frequency,
+        contexts, examples, confidence, last_seen
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `);
+
+    this.transaction(() => {
+      for (const pattern of patterns) {
+        stmt.run(
+          pattern.patternId,
+          pattern.patternType,
+          JSON.stringify(pattern.patternContent),
+          pattern.frequency,
+          JSON.stringify(pattern.contexts),
+          JSON.stringify(pattern.examples),
+          pattern.confidence
+        );
+      }
+    });
+  }
+
+  /**
+   * Batch insert feature maps in a single transaction.
+   */
+  insertFeatureMapsBatch(features: Omit<FeatureMap, 'createdAt' | 'updatedAt'>[]): void {
+    if (features.length === 0) return;
+
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO feature_maps (
+        id, project_path, feature_name, primary_files,
+        related_files, dependencies, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    this.transaction(() => {
+      for (const feature of features) {
+        stmt.run(
+          feature.id,
+          feature.projectPath,
+          feature.featureName,
+          JSON.stringify(feature.primaryFiles),
+          JSON.stringify(feature.relatedFiles),
+          JSON.stringify(feature.dependencies),
+          feature.status
+        );
+      }
+    });
   }
 
   // Semantic Concepts
@@ -162,7 +389,7 @@ export class SQLiteDatabase {
 
   getSemanticConcepts(filePath?: string): SemanticConcept[] {
     let query = 'SELECT * FROM semantic_concepts';
-    let params: any[] = [];
+    let params: QueryParams = [];
 
     if (filePath) {
       query += ' WHERE file_path = ?';
@@ -170,7 +397,7 @@ export class SQLiteDatabase {
     }
 
     const stmt = this.db.prepare(query);
-    const rows = stmt.all(...params) as any[];
+    const rows = stmt.all(...params) as SemanticConceptRow[];
 
     return rows.map(row => ({
       id: row.id,
@@ -208,7 +435,7 @@ export class SQLiteDatabase {
 
   getDeveloperPatterns(patternType?: string, limit?: number): DeveloperPattern[] {
     let query = 'SELECT * FROM developer_patterns';
-    let params: any[] = [];
+    let params: QueryParams = [];
 
     if (patternType) {
       query += ' WHERE pattern_type = ?';
@@ -227,7 +454,7 @@ export class SQLiteDatabase {
     }
 
     const stmt = this.db.prepare(query);
-    const rows = stmt.all(...params) as any[];
+    const rows = stmt.all(...params) as DeveloperPatternRow[];
 
     return rows.map(row => ({
       patternId: row.pattern_id,
@@ -263,7 +490,7 @@ export class SQLiteDatabase {
 
   getFileIntelligence(filePath: string): FileIntelligence | null {
     const stmt = this.db.prepare('SELECT * FROM file_intelligence WHERE file_path = ?');
-    const row = stmt.get(filePath) as any;
+    const row = stmt.get(filePath) as FileIntelligenceRow | undefined;
 
     if (!row) return null;
 
@@ -301,7 +528,7 @@ export class SQLiteDatabase {
 
   getAIInsights(insightType?: string): AIInsight[] {
     let query = 'SELECT * FROM ai_insights';
-    let params: any[] = [];
+    let params: QueryParams = [];
 
     if (insightType) {
       query += ' WHERE insight_type = ?';
@@ -311,7 +538,7 @@ export class SQLiteDatabase {
     query += ' ORDER BY confidence_score DESC, created_at DESC';
 
     const stmt = this.db.prepare(query);
-    const rows = stmt.all(...params) as any[];
+    const rows = stmt.all(...params) as AIInsightRow[];
 
     return rows.map(row => ({
       insightId: row.insight_id,
@@ -354,13 +581,13 @@ export class SQLiteDatabase {
     }
 
     // Try to find feature maps with any of the path variants
-    let rows: any[] = [];
+    let rows: FeatureMapRow[] = [];
     for (const path of paths) {
       const stmt = this.db.prepare(`
         SELECT * FROM feature_map WHERE project_path = ? AND status = 'active'
         ORDER BY feature_name
       `);
-      rows = stmt.all(path) as any[];
+      rows = stmt.all(path) as FeatureMapRow[];
       if (rows.length > 0) break;
     }
 
@@ -378,14 +605,16 @@ export class SQLiteDatabase {
   }
 
   searchFeatureMaps(projectPath: string, query: string): FeatureMap[] {
+    // Escape LIKE special characters to prevent wildcard injection
+    const escapedQuery = escapeLikePattern(query);
     const stmt = this.db.prepare(`
       SELECT * FROM feature_map
       WHERE project_path = ? AND status = 'active'
-        AND (feature_name LIKE ? OR feature_name LIKE ? OR feature_name LIKE ?)
+        AND (feature_name LIKE ? ESCAPE '\\' OR feature_name LIKE ? ESCAPE '\\' OR feature_name LIKE ? ESCAPE '\\')
       ORDER BY feature_name
     `);
-    const searchPattern = `%${query}%`;
-    const rows = stmt.all(projectPath, searchPattern, searchPattern.toLowerCase(), searchPattern.toUpperCase()) as any[];
+    const searchPattern = `%${escapedQuery}%`;
+    const rows = stmt.all(projectPath, searchPattern, searchPattern.toLowerCase(), searchPattern.toUpperCase()) as FeatureMapRow[];
 
     return rows.map(row => ({
       id: row.id,
@@ -406,7 +635,7 @@ export class SQLiteDatabase {
       WHERE project_path = ? AND feature_name = ? AND status = 'active'
       LIMIT 1
     `);
-    const row = stmt.get(projectPath, featureName) as any;
+    const row = stmt.get(projectPath, featureName) as FeatureMapRow | undefined;
 
     if (!row) return null;
 
@@ -450,13 +679,13 @@ export class SQLiteDatabase {
     }
 
     // Try to find entry points with any of the path variants
-    let rows: any[] = [];
+    let rows: EntryPointRow[] = [];
     for (const path of paths) {
       const stmt = this.db.prepare(`
         SELECT * FROM entry_points WHERE project_path = ?
         ORDER BY entry_type, file_path
       `);
-      rows = stmt.all(path) as any[];
+      rows = stmt.all(path) as EntryPointRow[];
       if (rows.length > 0) break;
     }
 
@@ -465,8 +694,8 @@ export class SQLiteDatabase {
       projectPath: row.project_path,
       entryType: row.entry_type,
       filePath: row.file_path,
-      description: row.description,
-      framework: row.framework,
+      description: row.description ?? undefined,
+      framework: row.framework ?? undefined,
       createdAt: new Date(row.created_at + ' UTC')
     }));
   }
@@ -498,13 +727,13 @@ export class SQLiteDatabase {
     }
 
     // Try to find key directories with any of the path variants
-    let rows: any[] = [];
+    let rows: KeyDirectoryRow[] = [];
     for (const path of paths) {
       const stmt = this.db.prepare(`
         SELECT * FROM key_directories WHERE project_path = ?
         ORDER BY directory_type, directory_path
       `);
-      rows = stmt.all(path) as any[];
+      rows = stmt.all(path) as KeyDirectoryRow[];
       if (rows.length > 0) break;
     }
 
@@ -514,7 +743,7 @@ export class SQLiteDatabase {
       directoryPath: row.directory_path,
       directoryType: row.directory_type,
       fileCount: row.file_count,
-      description: row.description,
+      description: row.description ?? undefined,
       createdAt: new Date(row.created_at + ' UTC')
     }));
   }
@@ -563,18 +792,18 @@ export class SQLiteDatabase {
     const stmt = this.db.prepare(`
       SELECT * FROM project_metadata WHERE project_path = ? LIMIT 1
     `);
-    const row = stmt.get(projectPath) as any;
+    const row = stmt.get(projectPath) as ProjectMetadataRow | undefined;
 
     if (!row) return null;
 
     return {
       projectId: row.project_id,
       projectPath: row.project_path,
-      projectName: row.project_name,
-      languagePrimary: row.language_primary,
+      projectName: row.project_name ?? undefined,
+      languagePrimary: row.language_primary ?? undefined,
       languagesDetected: JSON.parse(row.languages_detected || '[]'),
       frameworkDetected: JSON.parse(row.framework_detected || '[]'),
-      intelligenceVersion: row.intelligence_version,
+      intelligenceVersion: row.intelligence_version ?? undefined,
       lastFullScan: row.last_full_scan ? new Date(row.last_full_scan + ' UTC') : undefined,
       createdAt: new Date(row.created_at + ' UTC'),
       updatedAt: new Date(row.updated_at + ' UTC')
@@ -604,7 +833,7 @@ export class SQLiteDatabase {
 
   updateWorkSession(sessionId: string, updates: Partial<Omit<WorkSession, 'id' | 'projectPath' | 'sessionStart' | 'lastUpdated'>>): void {
     const fields: string[] = [];
-    const values: any[] = [];
+    const values: QueryParams = [];
 
     if (updates.sessionEnd !== undefined) {
       fields.push('session_end = ?');
@@ -654,7 +883,7 @@ export class SQLiteDatabase {
       ORDER BY session_start DESC
       LIMIT 1
     `);
-    const row = stmt.get(projectPath) as any;
+    const row = stmt.get(projectPath) as WorkSessionRow | undefined;
 
     if (!row) return null;
 
@@ -663,12 +892,12 @@ export class SQLiteDatabase {
       projectPath: row.project_path,
       sessionStart: new Date(row.session_start + ' UTC'),
       sessionEnd: row.session_end ? new Date(row.session_end + ' UTC') : undefined,
-      lastFeature: row.last_feature,
+      lastFeature: row.last_feature ?? undefined,
       currentFiles: JSON.parse(row.current_files || '[]'),
       completedTasks: JSON.parse(row.completed_tasks || '[]'),
       pendingTasks: JSON.parse(row.pending_tasks || '[]'),
       blockers: JSON.parse(row.blockers || '[]'),
-      sessionNotes: row.session_notes,
+      sessionNotes: row.session_notes ?? undefined,
       lastUpdated: new Date(row.last_updated + ' UTC')
     };
   }
@@ -680,19 +909,19 @@ export class SQLiteDatabase {
       ORDER BY session_start DESC
       LIMIT ?
     `);
-    const rows = stmt.all(projectPath, limit) as any[];
+    const rows = stmt.all(projectPath, limit) as WorkSessionRow[];
 
     return rows.map(row => ({
       id: row.id,
       projectPath: row.project_path,
       sessionStart: new Date(row.session_start + ' UTC'),
       sessionEnd: row.session_end ? new Date(row.session_end + ' UTC') : undefined,
-      lastFeature: row.last_feature,
+      lastFeature: row.last_feature ?? undefined,
       currentFiles: JSON.parse(row.current_files || '[]'),
       completedTasks: JSON.parse(row.completed_tasks || '[]'),
       pendingTasks: JSON.parse(row.pending_tasks || '[]'),
       blockers: JSON.parse(row.blockers || '[]'),
-      sessionNotes: row.session_notes,
+      sessionNotes: row.session_notes ?? undefined,
       lastUpdated: new Date(row.last_updated + ' UTC')
     }));
   }
@@ -720,14 +949,14 @@ export class SQLiteDatabase {
       ORDER BY made_at DESC
       LIMIT ?
     `);
-    const rows = stmt.all(projectPath, limit) as any[];
+    const rows = stmt.all(projectPath, limit) as ProjectDecisionRow[];
 
     return rows.map(row => ({
       id: row.id,
       projectPath: row.project_path,
       decisionKey: row.decision_key,
       decisionValue: row.decision_value,
-      reasoning: row.reasoning,
+      reasoning: row.reasoning ?? undefined,
       madeAt: new Date(row.made_at + ' UTC')
     }));
   }
@@ -737,7 +966,7 @@ export class SQLiteDatabase {
       SELECT * FROM project_decisions
       WHERE project_path = ? AND decision_key = ?
     `);
-    const row = stmt.get(projectPath, decisionKey) as any;
+    const row = stmt.get(projectPath, decisionKey) as ProjectDecisionRow | undefined;
 
     if (!row) return null;
 
@@ -746,12 +975,20 @@ export class SQLiteDatabase {
       projectPath: row.project_path,
       decisionKey: row.decision_key,
       decisionValue: row.decision_value,
-      reasoning: row.reasoning,
+      reasoning: row.reasoning ?? undefined,
       madeAt: new Date(row.made_at + ' UTC')
     };
   }
 
   close(): void {
+    // Checkpoint WAL before closing to ensure all data is persisted to main database
+    // TRUNCATE mode resets WAL file to zero bytes after checkpoint
+    try {
+      this.db.pragma('wal_checkpoint(TRUNCATE)');
+    } catch (error) {
+      // Checkpoint may fail in :memory: mode, which is fine
+      Logger.warn('WAL checkpoint skipped:', error instanceof Error ? error.message : String(error));
+    }
     this.db.close();
   }
 }

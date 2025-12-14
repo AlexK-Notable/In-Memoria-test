@@ -230,7 +230,7 @@ export class InteractiveSetup {
       // Phase 1: Semantic learning
       tracker.startPhase('semantic_analysis');
       const concepts = await semanticEngine.learnFromCodebase(config.projectPath,
-        (current, total, message) => {
+        (current, _total, message) => {
           tracker.updateProgress('semantic_analysis', current, message);
         }
       );
@@ -239,7 +239,7 @@ export class InteractiveSetup {
       // Phase 2: Pattern learning
       tracker.startPhase('pattern_learning');
       const patterns = await patternEngine.learnFromCodebase(config.projectPath,
-        (current, total, message) => {
+        (current, _total, message) => {
           tracker.updateProgress('pattern_learning', Math.floor((current / 100) * fileCount), message);
         }
       );
