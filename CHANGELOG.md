@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ♻️ **Refactored**
+
+- **Major architectural modularization** – Comprehensive refactoring for improved testability, type safety, and maintainability
+  - New centralized type system in `src/types/` with domain types, response types, and runtime type guards
+  - New engine interfaces in `src/interfaces/` enabling dependency injection and mock testing
+  - New utility modules: LRU cache, error classifier, parameter validator, response wrapper, security utilities
+  - New MCP components: Tool Registry for organized tool management, Composite Tools for multi-step operations
+  - New storage layer: Repository pattern, statement caching, query caching
+  - New Learning Pipeline with staged execution, progress tracking, and cancellation support
+  - Added 17 new test files with comprehensive coverage for all new modules
+  - All 567 tests passing across 25 test files
+
 ## [0.6.0] - 2025-11-12
 
 ### 🐛 **Fixed**
