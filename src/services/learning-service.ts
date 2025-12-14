@@ -4,6 +4,13 @@ import { SQLiteDatabase } from '../storage/sqlite-db.js';
 import { SemanticVectorDB } from '../storage/vector-db.js';
 import { config } from '../config/config.js';
 import { nanoid } from 'nanoid';
+import {
+  LearningPipeline,
+  createLearningPipeline,
+  LearningStage,
+  type PipelineContext,
+  type ProgressUpdate,
+} from './learning-pipeline.js';
 
 // Local types for learning operations
 interface LearnedConcept {
@@ -583,5 +590,247 @@ export class LearningService {
     } else {
       return 'Modular';
     }
+  }
+
+  // ============================================================================
+  // Pipeline-Based Learning (Alternative API with cancellation support)
+  // ============================================================================
+
+  /**
+   * Active learning pipeline (for cancellation support)
+   */
+  private static activePipeline: LearningPipeline | null = null;
+
+  /**
+   * Create a configured learning pipeline for a project.
+   * This provides a structured approach to learning with stage-based
+   * progress tracking and cancellation support.
+   *
+   * @param path - Project path to learn from
+   * @param options - Learning options
+   * @returns Configured LearningPipeline instance
+   */
+  static createPipeline(
+    path: string,
+    options: LearningOptions = {}
+  ): LearningPipeline {
+    // Create project-specific components (will be initialized in pipeline)
+    const projectDbPath = config.getDatabasePath(path);
+    let projectDatabase: SQLiteDatabase | null = null;
+    let projectVectorDB: SemanticVectorDB | null = null;
+    let projectSemanticEngine: SemanticEngine | null = null;
+    let projectPatternEngine: PatternEngine | null = null;
+    let concepts: LearnedConcept[] = [];
+    let patterns: LearnedPattern[] = [];
+    let codebaseAnalysis: CodebaseAnalysisResult | null = null;
+
+    const pipeline = createLearningPipeline({
+      onInitialization: async (ctx: PipelineContext) => {
+        // Initialize components
+        projectDatabase = new SQLiteDatabase(projectDbPath);
+        projectVectorDB = new SemanticVectorDB(process.env.OPENAI_API_KEY);
+        projectSemanticEngine = new SemanticEngine(projectDatabase, projectVectorDB);
+        projectPatternEngine = new PatternEngine(projectDatabase);
+
+        // Check existing intelligence
+        if (!options.force && projectDatabase) {
+          const existing = await LearningService.checkExistingIntelligence(projectDatabase, path);
+          if (existing && existing.concepts > 0) {
+            return { ...ctx, skipRemaining: true, existingIntelligence: existing };
+          }
+        }
+
+        return { ...ctx, initialized: true };
+      },
+
+      onFileDiscovery: async (ctx: PipelineContext) => {
+        if (ctx.skipRemaining) return ctx;
+
+        // File discovery happens as part of codebase analysis
+        codebaseAnalysis = projectSemanticEngine
+          ? await projectSemanticEngine.analyzeCodebase(path)
+          : { languages: [], frameworks: [] };
+
+        return {
+          ...ctx,
+          languages: codebaseAnalysis?.languages || [],
+          frameworks: codebaseAnalysis?.frameworks || [],
+        };
+      },
+
+      onParsing: async (ctx: PipelineContext) => {
+        if (ctx.skipRemaining) return ctx;
+        // Parsing is implicit in concept extraction
+        return ctx;
+      },
+
+      onConceptExtraction: async (ctx: PipelineContext) => {
+        if (ctx.skipRemaining) return ctx;
+
+        concepts = projectSemanticEngine
+          ? await projectSemanticEngine.learnFromCodebase(path, options.progressCallback)
+          : [];
+
+        return { ...ctx, conceptCount: concepts.length };
+      },
+
+      onPatternDetection: async (ctx: PipelineContext) => {
+        if (ctx.skipRemaining) return ctx;
+
+        patterns = projectPatternEngine
+          ? await projectPatternEngine.learnFromCodebase(path, options.progressCallback)
+          : [];
+
+        return { ...ctx, patternCount: patterns.length };
+      },
+
+      onIndexing: async (ctx: PipelineContext) => {
+        if (ctx.skipRemaining) return ctx;
+
+        // Store intelligence and build indices
+        if (projectDatabase) {
+          await LearningService.storeIntelligence(projectDatabase, path, concepts, patterns);
+        }
+
+        // Build vector index
+        let vectorCount = 0;
+        if (projectVectorDB) {
+          vectorCount = await LearningService.buildSemanticIndex(
+            projectVectorDB,
+            concepts,
+            patterns
+          );
+        }
+
+        return { ...ctx, vectorCount };
+      },
+
+      onCompletion: async (ctx: PipelineContext) => {
+        // Clean up resources
+        if (projectSemanticEngine) {
+          projectSemanticEngine.cleanup();
+        }
+        if (projectVectorDB) {
+          try {
+            await projectVectorDB.close();
+          } catch {
+            // Ignore close errors
+          }
+        }
+        if (projectDatabase) {
+          projectDatabase.close();
+        }
+
+        return {
+          ...ctx,
+          success: true,
+          conceptsLearned: concepts.length,
+          patternsLearned: patterns.length,
+        };
+      },
+    });
+
+    return pipeline;
+  }
+
+  /**
+   * Learn from codebase using the pipeline API with cancellation support.
+   *
+   * @param path - Project path
+   * @param options - Learning options including progress callback
+   * @returns Promise resolving to LearningResult
+   */
+  static async learnWithPipeline(
+    path: string,
+    options: LearningOptions = {}
+  ): Promise<LearningResult> {
+    const startTime = Date.now();
+
+    // Create and store pipeline for cancellation
+    const pipeline = this.createPipeline(path, options);
+    this.activePipeline = pipeline;
+
+    try {
+      // Map pipeline progress to legacy callback format
+      const onProgress = options.progressCallback
+        ? (update: ProgressUpdate) => {
+            // Convert stage progress (0-100) to item progress
+            const stageToItemMap: Record<string, { current: number; total: number }> = {
+              [LearningStage.Initialization]: { current: 1, total: 7 },
+              [LearningStage.FileDiscovery]: { current: 2, total: 7 },
+              [LearningStage.Parsing]: { current: 3, total: 7 },
+              [LearningStage.ConceptExtraction]: { current: 4, total: 7 },
+              [LearningStage.PatternDetection]: { current: 5, total: 7 },
+              [LearningStage.Indexing]: { current: 6, total: 7 },
+              [LearningStage.Completion]: { current: 7, total: 7 },
+            };
+
+            const itemProgress = stageToItemMap[update.stage] || { current: 0, total: 7 };
+            options.progressCallback!(
+              itemProgress.current,
+              itemProgress.total,
+              update.message || `Stage: ${update.stage}`
+            );
+          }
+        : undefined;
+
+      const result = await pipeline.execute({ projectPath: path }, { onProgress });
+
+      const timeElapsed = Date.now() - startTime;
+
+      return {
+        success: result.success as boolean,
+        conceptsLearned: (result.conceptsLearned as number) || 0,
+        patternsLearned: (result.patternsLearned as number) || 0,
+        featuresLearned: 0, // Not tracked in pipeline yet
+        insights: [`Pipeline completed in ${timeElapsed}ms`],
+        timeElapsed,
+      };
+    } catch (error) {
+      const timeElapsed = Date.now() - startTime;
+      const isCancelled = pipeline.getState() === 'cancelled';
+
+      return {
+        success: false,
+        conceptsLearned: 0,
+        patternsLearned: 0,
+        featuresLearned: 0,
+        insights: [
+          isCancelled
+            ? 'Learning cancelled by user'
+            : `Pipeline failed: ${error instanceof Error ? error.message : error}`,
+        ],
+        timeElapsed,
+      };
+    } finally {
+      this.activePipeline = null;
+    }
+  }
+
+  /**
+   * Cancel the active learning pipeline.
+   *
+   * @returns true if a pipeline was cancelled, false if no active pipeline
+   */
+  static cancelLearning(): boolean {
+    if (this.activePipeline) {
+      this.activePipeline.cancel();
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Check if learning is currently in progress.
+   */
+  static isLearning(): boolean {
+    return this.activePipeline !== null && this.activePipeline.getState() === 'running';
+  }
+
+  /**
+   * Get current learning stage (if learning is in progress).
+   */
+  static getCurrentStage(): LearningStage | null {
+    return this.activePipeline?.getCurrentStage() ?? null;
   }
 }
