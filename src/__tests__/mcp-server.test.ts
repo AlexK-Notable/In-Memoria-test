@@ -25,7 +25,10 @@ describe('CodeCartographerMCP Server', () => {
 
   it('should handle tool routing without errors', async () => {
     const server = new CodeCartographerMCP();
-    
+
+    // Initialize server before testing tool routing
+    await server.initializeForTesting();
+
     // Test invalid tool name
     try {
       await (server as any).routeToolCall('invalid_tool', {});
@@ -33,5 +36,8 @@ describe('CodeCartographerMCP Server', () => {
     } catch (error: unknown) {
       expect((error as Error).message).toContain('Unknown tool');
     }
+
+    // Clean up
+    await server.stop();
   });
 });

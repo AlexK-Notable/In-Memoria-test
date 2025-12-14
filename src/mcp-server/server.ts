@@ -19,6 +19,8 @@ import { validateInput, VALIDATION_SCHEMAS } from './validation.js';
 import { config } from '../config/config.js';
 import { Logger } from '../utils/logger.js';
 import { shutdownManager } from '../utils/shutdown-manager.js';
+import { ToolRegistry } from './tool-registry.js';
+import { createConfiguredRegistry } from './tool-definitions.js';
 
 export class CodeCartographerMCP {
   private server: Server;
@@ -30,6 +32,7 @@ export class CodeCartographerMCP {
   private intelligenceTools!: IntelligenceTools;
   private automationTools!: AutomationTools;
   private monitoringTools!: MonitoringTools;
+  private toolRegistry!: ToolRegistry;
 
   constructor() {
     this.server = new Server(
@@ -94,6 +97,16 @@ export class CodeCartographerMCP {
       );
       Logger.info('Tool collections initialized');
 
+      // Initialize tool registry with all tool collections
+      this.toolRegistry = createConfiguredRegistry({
+        coreTools: this.coreTools,
+        intelligenceTools: this.intelligenceTools,
+        automationTools: this.automationTools,
+        monitoringTools: this.monitoringTools,
+      });
+      const stats = this.toolRegistry.getStats();
+      Logger.info(`Tool registry initialized: ${stats.totalTools} tools in ${stats.categories.length} categories`);
+
       Logger.info('In Memoria components initialized successfully');
     } catch (error: unknown) {
       Logger.error('Failed to initialize In Memoria components:', error);
@@ -103,25 +116,35 @@ export class CodeCartographerMCP {
   }
 
   private setupHandlers(): void {
-    // List available tools
+    // List available tools (using registry for organized tool management)
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
       return {
-        tools: [
-          ...this.coreTools.tools,
-          ...this.intelligenceTools.tools,
-          ...this.automationTools.tools,
-          ...this.monitoringTools.tools
-        ]
+        tools: this.toolRegistry.toMCPToolDefinitions()
       };
     });
 
-    // Handle tool calls
+    // Handle tool calls (using registry for centralized execution)
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
 
       try {
-        // Route to appropriate tool handler
-        const result = await this.routeToolCall(name, args);
+        // Validate input using Zod schemas (if available)
+        let validatedArgs = args ?? {};
+        const schema = VALIDATION_SCHEMAS[name as keyof typeof VALIDATION_SCHEMAS];
+        if (schema) {
+          validatedArgs = validateInput(schema, validatedArgs, name);
+        }
+
+        // Check if tool exists
+        if (!this.toolRegistry.has(name)) {
+          throw new McpError(
+            ErrorCode.MethodNotFound,
+            `Unknown tool: ${name}`
+          );
+        }
+
+        // Execute via registry
+        const result = await this.toolRegistry.execute(name, validatedArgs as Record<string, unknown>);
 
         return {
           content: [
@@ -151,79 +174,15 @@ export class CodeCartographerMCP {
       args = validateInput(schema, args, name);
     }
 
-    // Core Analysis Tools
-    switch (name) {
-      case 'analyze_codebase':
-        return await this.coreTools.analyzeCodebase(args);
-
-      // DEPRECATED (Phase 4): Merged into analyze_codebase - now handles both files and directories
-      // case 'get_file_content':
-      //   return await this.coreTools.getFileContent(args);
-
-      // DEPRECATED (Phase 4): Merged into get_project_blueprint
-      // case 'get_project_structure':
-      //   return await this.coreTools.getProjectStructure(args);
-
-      case 'search_codebase':
-        return await this.coreTools.searchCodebase(args);
-
-      // DEPRECATED (Phase 4): Not agent-facing, removed from tool list
-      // case 'generate_documentation':
-      //   return await this.coreTools.generateDocumentation(args);
-
-      // Intelligence Tools
-      case 'learn_codebase_intelligence':
-        return await this.intelligenceTools.learnCodebaseIntelligence(args);
-
-      case 'get_semantic_insights':
-        return await this.intelligenceTools.getSemanticInsights(args);
-
-      case 'get_pattern_recommendations':
-        return await this.intelligenceTools.getPatternRecommendations(args);
-
-      case 'predict_coding_approach':
-        return await this.intelligenceTools.predictCodingApproach(args);
-
-      case 'get_developer_profile':
-        return await this.intelligenceTools.getDeveloperProfile(args);
-
-      case 'contribute_insights':
-        return await this.intelligenceTools.contributeInsights(args);
-
-      case 'get_project_blueprint':
-        return await this.intelligenceTools.getProjectBlueprint(args);
-
-      // Automation Tools
-      case 'auto_learn_if_needed':
-        return await this.automationTools.autoLearnIfNeeded(args);
-
-      // DEPRECATED (Phase 4): Merged into get_project_blueprint - returns learning status in blueprint
-      // case 'get_learning_status':
-      //   return await this.automationTools.getLearningStatus(args);
-
-      // DEPRECATED (Phase 4): Merged into auto_learn_if_needed - same functionality
-      // case 'quick_setup':
-      //   return await this.automationTools.quickSetup(args);
-
-      // Monitoring Tools
-      case 'get_system_status':
-        return await this.monitoringTools.getSystemStatus(args);
-
-      case 'get_intelligence_metrics':
-        return await this.monitoringTools.getIntelligenceMetrics(args);
-
-      case 'get_performance_status':
-        return await this.monitoringTools.getPerformanceStatus(args);
-
-      case 'health_check':
-        return await this.monitoringTools.healthCheck(args);
-
-      default:
-        throw new McpError(
-          ErrorCode.MethodNotFound,
-          `Unknown tool: ${name}`
-        );
+    // Use registry for centralized tool execution
+    if (!this.toolRegistry.has(name)) {
+      throw new McpError(
+        ErrorCode.MethodNotFound,
+        `Unknown tool: ${name}`
+      );
     }
+
+    return await this.toolRegistry.execute(name, args);
   }
 
   async start(): Promise<void> {
@@ -242,12 +201,14 @@ export class CodeCartographerMCP {
    * Get all registered tools (for testing and introspection)
    */
   getAllTools(): any[] {
-    return [
-      ...this.coreTools.tools,
-      ...this.intelligenceTools.tools,
-      ...this.automationTools.tools,
-      ...this.monitoringTools.tools
-    ];
+    return this.toolRegistry.toMCPToolDefinitions();
+  }
+
+  /**
+   * Get the tool registry (for advanced introspection)
+   */
+  getToolRegistry(): ToolRegistry {
+    return this.toolRegistry;
   }
 
   /**
