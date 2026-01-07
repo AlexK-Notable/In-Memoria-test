@@ -14,6 +14,7 @@ export interface CircuitBreakerOptions {
   recoveryTimeout: number;     // Time to wait before half-open (ms)
   requestTimeout: number;      // Individual request timeout (ms)
   monitoringWindow: number;    // Time window for failure counting (ms)
+  successThreshold?: number;   // Number of consecutive successes to close from HALF_OPEN (default: 3)
 }
 
 export interface CircuitBreakerStats {
@@ -57,8 +58,12 @@ export class CircuitBreaker {
   private lastFailureTime?: number;
   private totalRequests: number = 0;
   private requestTimeouts: number[] = [];
+  private halfOpenSuccesses: number = 0;
+  private readonly successThreshold: number;
 
-  constructor(private options: CircuitBreakerOptions) {}
+  constructor(private options: CircuitBreakerOptions) {
+    this.successThreshold = options.successThreshold ?? 3;
+  }
 
   async execute<T>(operation: () => Promise<T>, fallback?: () => Promise<T>): Promise<T> {
     this.totalRequests++;
@@ -70,6 +75,7 @@ export class CircuitBreaker {
     if (this.state === CircuitState.OPEN) {
       if (this.canAttemptReset()) {
         this.state = CircuitState.HALF_OPEN;
+        this.halfOpenSuccesses = 0; // Reset counter when entering HALF_OPEN
       } else {
         // Don't mask the real error - provide detailed failure information
         const errorDetails = this.getDetailedErrorInfo();
@@ -146,12 +152,17 @@ export class CircuitBreaker {
 
   private onSuccess(): void {
     this.successes++;
-    
+
     if (this.state === CircuitState.HALF_OPEN) {
-      // Reset to closed after successful test
-      this.state = CircuitState.CLOSED;
-      this.failures = 0;
-      this.requestTimeouts = [];
+      this.halfOpenSuccesses++;
+
+      // Only close after reaching success threshold (prevents flapping)
+      if (this.halfOpenSuccesses >= this.successThreshold) {
+        this.state = CircuitState.CLOSED;
+        this.failures = 0;
+        this.requestTimeouts = [];
+        this.halfOpenSuccesses = 0;
+      }
     }
   }
 
@@ -160,8 +171,12 @@ export class CircuitBreaker {
     this.lastFailureTime = Date.now();
     this.requestTimeouts.push(this.lastFailureTime);
 
-    // Open circuit if threshold exceeded
-    if (this.failures >= this.options.failureThreshold) {
+    if (this.state === CircuitState.HALF_OPEN) {
+      // Failed during probe - go back to OPEN and reset success counter
+      this.state = CircuitState.OPEN;
+      this.halfOpenSuccesses = 0;
+    } else if (this.failures >= this.options.failureThreshold) {
+      // Open circuit if threshold exceeded
       this.state = CircuitState.OPEN;
     }
   }
@@ -194,6 +209,7 @@ export class CircuitBreaker {
     this.lastFailureTime = undefined;
     this.totalRequests = 0;
     this.requestTimeouts = [];
+    this.halfOpenSuccesses = 0;
   }
 
   private getDetailedErrorInfo(): ErrorDetails {

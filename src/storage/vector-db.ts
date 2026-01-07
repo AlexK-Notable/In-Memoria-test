@@ -2,6 +2,7 @@ import { Surreal } from 'surrealdb';
 import * as SurrealNodeModule from '@surrealdb/node';
 import { pipeline } from '@xenova/transformers';
 import { Logger } from '../utils/logger.js';
+import { withRetry, RetryPresets } from '../utils/retry.js';
 
 export interface CodeMetadata {
   id: string;
@@ -61,15 +62,53 @@ export class SemanticVectorDB {
     'className', 'complexity', 'lineCount'
   ]);
 
-  constructor(_apiKey?: string) {
+  constructor(apiKey?: string) {
     // SurrealDB module type assertion required due to dynamic engine loading
     // The @surrealdb/node module dynamically provides engines but lacks proper type exports
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     this.db = new Surreal({ engines: (SurrealNodeModule as any).surrealdbNodeEngines() });
 
-    // API key parameter kept for backwards compatibility but unused
+    // Validate API key if provided
+    const providedKey = apiKey || process.env.OPENAI_API_KEY;
+    if (providedKey) {
+      const validationResult = SemanticVectorDB.validateApiKey(providedKey);
+      if (!validationResult.valid) {
+        Logger.warn(`OpenAI API key validation warning: ${validationResult.message}`);
+        Logger.info('Continuing with local embeddings (Xenova transformers)');
+      } else {
+        Logger.info('OpenAI API key format validated (local embeddings will still be used)');
+      }
+    }
+
     // Store promise so we can await initialization later if needed
     this.embeddingInitPromise = this.initializeLocalEmbeddings();
+  }
+
+  /**
+   * Validate OpenAI API key format.
+   * Returns validation result with message.
+   */
+  static validateApiKey(key: string | undefined): { valid: boolean; message: string } {
+    if (!key) {
+      return { valid: false, message: 'API key is undefined or empty' };
+    }
+
+    // OpenAI API key formats:
+    // - Legacy: sk-[48 alphanumeric chars] (51 chars total)
+    // - Project: sk-proj-[variable length alphanumeric and dashes]
+    // - Service accounts: sk-svcacct-[variable length]
+    const legacyPattern = /^sk-[a-zA-Z0-9]{32,}$/;
+    const projectPattern = /^sk-proj-[a-zA-Z0-9_-]{32,}$/;
+    const servicePattern = /^sk-svcacct-[a-zA-Z0-9_-]{32,}$/;
+
+    if (legacyPattern.test(key) || projectPattern.test(key) || servicePattern.test(key)) {
+      return { valid: true, message: 'API key format is valid' };
+    }
+
+    return {
+      valid: false,
+      message: 'API key format appears invalid. Expected sk-..., sk-proj-..., or sk-svcacct-... pattern'
+    };
   }
 
   /**
@@ -109,25 +148,46 @@ export class SemanticVectorDB {
       // Use SurrealKV for persistent storage of vector embeddings
       // IMPORTANT: Requires SURREAL_SYNC_DATA=true for crash safety
       const dbPath = process.env.IN_MEMORIA_VECTOR_DB_PATH || 'in-memoria-vectors.db';
-      await this.db.connect(`surrealkv://${dbPath}`);
 
-      // Use database and namespace
-      await this.db.use({
-        namespace: 'in_memoria',
-        database: collectionName
-      });
+      // Wrap database connection with retry logic for transient connection issues
+      await withRetry(
+        async () => {
+          await this.db.connect(`surrealkv://${dbPath}`);
+        },
+        RetryPresets.database,
+        'VectorDB.connect'
+      );
+
+      // Use database and namespace with retry
+      await withRetry(
+        async () => {
+          await this.db.use({
+            namespace: 'in_memoria',
+            database: collectionName
+          });
+        },
+        RetryPresets.database,
+        'VectorDB.use'
+      );
 
       // Define the code documents table with full-text search capabilities
-      await this.db.query(`
-        DEFINE ANALYZER code_analyzer TOKENIZERS blank FILTERS lowercase,ascii;
-        DEFINE TABLE code_documents SCHEMAFULL;
-        DEFINE FIELD code ON code_documents TYPE string;
-        DEFINE FIELD embedding ON code_documents TYPE array;
-        DEFINE FIELD metadata ON code_documents TYPE object;
-        DEFINE FIELD created ON code_documents TYPE datetime DEFAULT time::now();
-        DEFINE FIELD updated ON code_documents TYPE datetime DEFAULT time::now();
-        DEFINE INDEX code_content ON code_documents COLUMNS code SEARCH ANALYZER code_analyzer BM25(1.2,0.75) HIGHLIGHTS;
-      `);
+      // Schema definition is idempotent, so retry is safe
+      await withRetry(
+        async () => {
+          await this.db.query(`
+            DEFINE ANALYZER code_analyzer TOKENIZERS blank FILTERS lowercase,ascii;
+            DEFINE TABLE code_documents SCHEMAFULL;
+            DEFINE FIELD code ON code_documents TYPE string;
+            DEFINE FIELD embedding ON code_documents TYPE array;
+            DEFINE FIELD metadata ON code_documents TYPE object;
+            DEFINE FIELD created ON code_documents TYPE datetime DEFAULT time::now();
+            DEFINE FIELD updated ON code_documents TYPE datetime DEFAULT time::now();
+            DEFINE INDEX code_content ON code_documents COLUMNS code SEARCH ANALYZER code_analyzer BM25(1.2,0.75) HIGHLIGHTS;
+          `);
+        },
+        RetryPresets.database,
+        'VectorDB.defineSchema'
+      );
 
       this.initialized = true;
     } catch (error) {
@@ -150,7 +210,14 @@ export class SemanticVectorDB {
       updated: new Date()
     };
 
-    await this.db.create('code_documents', document);
+    // Wrap database write with retry for transient failures
+    await withRetry(
+      async () => {
+        await this.db.create('code_documents', document);
+      },
+      RetryPresets.database,
+      'VectorDB.storeCodeEmbedding'
+    );
   }
 
   async storeMultipleEmbeddings(
@@ -175,9 +242,15 @@ export class SemanticVectorDB {
       }))
     );
 
-    // Insert multiple documents
+    // Insert multiple documents with retry for each document
     for (const doc of documents) {
-      await this.db.create('code_documents', doc);
+      await withRetry(
+        async () => {
+          await this.db.create('code_documents', doc);
+        },
+        RetryPresets.database,
+        'VectorDB.storeMultipleEmbeddings'
+      );
     }
   }
 
@@ -200,7 +273,8 @@ export class SemanticVectorDB {
   async findSimilarCode(
     query: string,
     limit: number = 5,
-    filters?: Record<string, any>
+    filters?: Record<string, any>,
+    options?: { threshold?: number }
   ): Promise<SemanticSearchResult[]> {
     if (!this.initialized) {
       throw new Error('Vector database not initialized. Call initialize() first.');
@@ -208,6 +282,7 @@ export class SemanticVectorDB {
 
     // Validate filters against allowlist to prevent injection
     const validFilters = filters ? this.validateFilters(filters) : undefined;
+    const threshold = options?.threshold ?? 0.0; // Default: return all results
 
     if (!query || query.trim() === '') {
       // If no query, just return all documents matching filters
@@ -224,7 +299,12 @@ export class SemanticVectorDB {
 
       searchQuery += ` LIMIT $limit`;
 
-      const results = await this.db.query(searchQuery, params);
+      // Wrap database query with retry for transient failures
+      const results = await withRetry(
+        async () => this.db.query(searchQuery, params),
+        RetryPresets.embedding,
+        'VectorDB.findSimilarCode.queryAll'
+      );
       const documents = results[0] as any[] || [];
 
       return documents.map(doc => ({
@@ -235,37 +315,55 @@ export class SemanticVectorDB {
       }));
     }
 
-    // Use SurrealDB's full-text search for semantic similarity
-    let searchQuery = `
-      SELECT *, search::score(1) AS similarity
-      FROM code_documents
-      WHERE code @@ $query
-    `;
+    // Generate embedding for the query using the same method as stored documents
+    const queryEmbedding = await this.generateEmbedding(query);
 
-    // Add filters if provided
+    // Retrieve all documents (with optional filters) and compute similarity in-memory
+    // This is more reliable than depending on SurrealDB's vector functions
+    let searchQuery = 'SELECT * FROM code_documents';
+    const params: Record<string, any> = {};
+
     if (validFilters && Object.keys(validFilters).length > 0) {
       const filterConditions = Object.entries(validFilters)
         .map(([key, _]) => `metadata.${key} = $${key}`)
         .join(' AND ');
-      searchQuery += ` AND ${filterConditions}`;
-    }
-
-    searchQuery += ` ORDER BY similarity DESC LIMIT $limit`;
-
-    const params: Record<string, any> = { query, limit };
-    if (validFilters) {
+      searchQuery += ` WHERE ${filterConditions}`;
       Object.assign(params, validFilters);
     }
 
-    const results = await this.db.query(searchQuery, params);
+    // Wrap database query with retry for transient failures
+    const results = await withRetry(
+      async () => this.db.query(searchQuery, params),
+      RetryPresets.embedding,
+      'VectorDB.findSimilarCode.searchQuery'
+    );
     const documents = results[0] as any[] || [];
 
-    return documents.map(doc => ({
-      id: doc.id,
-      code: doc.code,
-      metadata: doc.metadata,
-      similarity: doc.similarity || 0
-    }));
+    // Calculate cosine similarity for each document
+    const scoredDocuments = documents
+      .map(doc => {
+        const docEmbedding = doc.embedding as number[] | undefined;
+        let similarity = 0;
+
+        if (docEmbedding && Array.isArray(docEmbedding) && docEmbedding.length > 0) {
+          similarity = this.calculateCosineSimilarity(queryEmbedding, docEmbedding);
+        }
+
+        return {
+          id: doc.id,
+          code: doc.code,
+          metadata: doc.metadata,
+          similarity
+        };
+      })
+      // Filter by threshold
+      .filter(doc => doc.similarity >= threshold)
+      // Sort by similarity descending (highest first)
+      .sort((a, b) => b.similarity - a.similarity)
+      // Limit results
+      .slice(0, limit);
+
+    return scoredDocuments;
   }
 
   async findSimilarCodeByFile(
@@ -289,12 +387,20 @@ export class SemanticVectorDB {
     }
 
     const embedding = await this.generateEmbedding(code);
-    await this.db.merge(id, {
-      code,
-      embedding,
-      metadata,
-      updated: new Date()
-    });
+
+    // Wrap database update with retry for transient failures
+    await withRetry(
+      async () => {
+        await this.db.merge(id, {
+          code,
+          embedding,
+          metadata,
+          updated: new Date()
+        });
+      },
+      RetryPresets.database,
+      'VectorDB.updateCodeEmbedding'
+    );
   }
 
   async deleteCodeEmbedding(id: string): Promise<void> {
@@ -302,7 +408,14 @@ export class SemanticVectorDB {
       throw new Error('Vector database not initialized. Call initialize() first.');
     }
 
-    await this.db.delete(id);
+    // Wrap database delete with retry for transient failures
+    await withRetry(
+      async () => {
+        await this.db.delete(id);
+      },
+      RetryPresets.database,
+      'VectorDB.deleteCodeEmbedding'
+    );
   }
 
   async deleteCodeEmbeddingsByFile(filePath: string): Promise<void> {
@@ -310,9 +423,16 @@ export class SemanticVectorDB {
       throw new Error('Vector database not initialized. Call initialize() first.');
     }
 
-    await this.db.query('DELETE code_documents WHERE metadata.filePath = $filePath', {
-      filePath
-    });
+    // Wrap database delete query with retry for transient failures
+    await withRetry(
+      async () => {
+        await this.db.query('DELETE code_documents WHERE metadata.filePath = $filePath', {
+          filePath
+        });
+      },
+      RetryPresets.database,
+      'VectorDB.deleteCodeEmbeddingsByFile'
+    );
   }
 
   async getCollectionStats(): Promise<{ count: number; metadata: any }> {
@@ -320,7 +440,12 @@ export class SemanticVectorDB {
       throw new Error('Vector database not initialized. Call initialize() first.');
     }
 
-    const result = await this.db.query('SELECT count() AS total FROM code_documents GROUP ALL');
+    // Wrap database query with retry for transient failures
+    const result = await withRetry(
+      async () => this.db.query('SELECT count() AS total FROM code_documents GROUP ALL'),
+      RetryPresets.database,
+      'VectorDB.getCollectionStats'
+    );
     const count = Array.isArray(result) && Array.isArray(result[0]) && result[0][0] ? (result[0][0] as any).total || 0 : 0;
 
     return {
@@ -368,10 +493,17 @@ export class SemanticVectorDB {
     if (this.localEmbeddingPipeline) {
       try {
         const cleanCode = this.preprocessCodeForEmbedding(code);
-        const result = await this.localEmbeddingPipeline(cleanCode, {
-          pooling: 'mean',
-          normalize: true
-        });
+
+        // Wrap embedding pipeline call with retry for transient failures
+        // (model loading issues, memory pressure, etc.)
+        const result = await withRetry(
+          async () => this.localEmbeddingPipeline!(cleanCode, {
+            pooling: 'mean',
+            normalize: true
+          }),
+          RetryPresets.embedding,
+          'VectorDB.getLocalEmbedding'
+        );
 
         // Convert tensor to array
         const embedding = Array.from(result.data) as number[];
@@ -706,6 +838,43 @@ export class SemanticVectorDB {
       }
     }
     this.embeddingCache.set(key, embedding);
+  }
+
+  /**
+   * Calculate cosine similarity between two vectors.
+   * Returns a value between -1 and 1, where 1 means identical direction.
+   * For normalized vectors: cosine_similarity = dot(a, b)
+   */
+  private calculateCosineSimilarity(a: number[], b: number[]): number {
+    if (a.length !== b.length) {
+      Logger.warn(`Vector dimension mismatch: ${a.length} vs ${b.length}`);
+      return 0;
+    }
+
+    if (a.length === 0) {
+      return 0;
+    }
+
+    // Calculate dot product and magnitudes
+    let dotProduct = 0;
+    let magnitudeA = 0;
+    let magnitudeB = 0;
+
+    for (let i = 0; i < a.length; i++) {
+      dotProduct += a[i] * b[i];
+      magnitudeA += a[i] * a[i];
+      magnitudeB += b[i] * b[i];
+    }
+
+    magnitudeA = Math.sqrt(magnitudeA);
+    magnitudeB = Math.sqrt(magnitudeB);
+
+    // Avoid division by zero
+    if (magnitudeA === 0 || magnitudeB === 0) {
+      return 0;
+    }
+
+    return dotProduct / (magnitudeA * magnitudeB);
   }
 
   /**

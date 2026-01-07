@@ -8,11 +8,13 @@ import {
 import { SemanticEngine } from '../../engines/semantic-engine.js';
 import { PatternEngine } from '../../engines/pattern-engine.js';
 import { IntelligenceTools } from './intelligence-tools.js';
+import { CoreAnalysisTools as CoreUtils } from './core-analysis-tools.js';
 import { readFileSync, statSync, readdirSync, lstatSync } from 'fs';
 import { join, relative, extname, basename } from 'path';
-import { detectLanguageFromPath } from '../../utils/language-registry.js';
 import { glob } from 'glob';
 import { ErrorUtils, InMemoriaError } from '../../utils/error-types.js';
+import { PathValidator } from '../../utils/path-validator.js';
+import { Logger } from '../../utils/logger.js';
 import type { SQLiteDatabase } from '../../storage/sqlite-db.js';
 import type { AnalyzedConcept, FileMetadata } from '../../types/index.js';
 
@@ -202,38 +204,6 @@ export class CoreAnalysisTools {
           required: ['query']
         }
       }
-      // DEPRECATED (Phase 4): Not agent-facing, removed from tool list
-      // {
-      //   name: 'generate_documentation',
-      //   description: 'Generate intelligent documentation for the codebase',
-      //   inputSchema: {
-      //     type: 'object',
-      //     properties: {
-      //       path: {
-      //         type: 'string',
-      //         description: 'Path to the codebase'
-      //       },
-      //       format: {
-      //         type: 'string',
-      //         enum: ['markdown', 'html', 'json'],
-      //         description: 'Output format for documentation'
-      //       },
-      //       includeExamples: {
-      //         type: 'boolean',
-      //         description: 'Include code examples in documentation'
-      //       },
-      //       includeArchitecture: {
-      //         type: 'boolean',
-      //         description: 'Include architectural analysis'
-      //       },
-      //       outputPath: {
-      //         type: 'string',
-      //         description: 'Optional path to save generated documentation'
-      //       }
-      //     },
-      //     required: ['path']
-      //   }
-      // }
     ];
   }
 
@@ -242,31 +212,32 @@ export class CoreAnalysisTools {
     if (!args.path || typeof args.path !== 'string') {
       throw new Error('Path parameter is required and must be a string');
     }
-    
-    // Sanitize path - prevent path traversal attacks
-    const sanitizedPath = args.path.replace(/\.\./g, '');
-    if (sanitizedPath !== args.path) {
-      throw new Error('Path contains invalid characters');
+
+    // Use unified path validation from PathValidator (security.ts integration)
+    const validationResult = PathValidator.validate(args.path, process.cwd(), { requireExists: true });
+    if (!validationResult.isValid) {
+      throw new Error(`Invalid path: ${validationResult.error}`);
     }
+    const safePath = validationResult.normalizedPath!;
 
     try {
       // Check if path is a file or directory
-      const stats = statSync(args.path);
+      const stats = statSync(safePath);
 
       if (stats.isFile()) {
         // FILE ANALYSIS - Token-efficient response focused on concepts
-        const content = readFileSync(args.path, 'utf-8');
-        const language = this.detectLanguage(args.path);
+        const content = readFileSync(safePath, 'utf-8');
+        const language = this.detectLanguage(safePath);
         const lineCount = content.split('\n').length;
 
         // Perform semantic analysis
-        const semanticConcepts = await this.semanticEngine.analyzeFileContent(args.path, content);
-        const patterns = await this.patternEngine.analyzeFilePatterns(args.path, content);
+        const semanticConcepts = await this.semanticEngine.analyzeFileContent(safePath, content);
+        const patterns = await this.patternEngine.analyzeFilePatterns(safePath, content);
         const complexity = this.calculateDetailedComplexity(content, semanticConcepts);
 
         return {
           type: 'file',
-          path: args.path,
+          path: safePath,
           language,
           lineCount,
           size: stats.size,
@@ -293,11 +264,11 @@ export class CoreAnalysisTools {
         };
       } else {
         // DIRECTORY ANALYSIS - Token-efficient codebase summary
-        const analysis = await this.semanticEngine.analyzeCodebase(args.path);
-        const patterns = await this.patternEngine.extractPatterns(args.path);
+        const analysis = await this.semanticEngine.analyzeCodebase(safePath);
+        const patterns = await this.patternEngine.extractPatterns(safePath);
 
         return {
-          path: args.path,
+          path: safePath,
           type: 'codebase',
           languages: analysis.languages,
           frameworks: analysis.frameworks,
@@ -322,9 +293,9 @@ export class CoreAnalysisTools {
         };
       }
     } catch (error) {
-      console.error('Analysis error:', error);
+      Logger.error('Analysis error', error instanceof Error ? error : new Error(String(error)), { path: safePath });
       return {
-        path: args.path,
+        path: safePath,
         languages: [],
         frameworks: [],
         complexity: { cyclomatic: 0, cognitive: 0, lines: 0 },
@@ -367,23 +338,25 @@ export class CoreAnalysisTools {
     if (!args.path || typeof args.path !== 'string') {
       throw new Error('Path parameter is required and must be a string');
     }
-    
-    // Sanitize path and check for dangerous patterns
-    if (args.path.includes('..') || args.path.includes('\0')) {
-      throw new Error('Path contains invalid characters');
+
+    // Use unified path validation from PathValidator (security.ts integration)
+    const validationResult = PathValidator.validate(args.path, process.cwd(), { requireExists: true });
+    if (!validationResult.isValid) {
+      throw new Error(`Invalid path: ${validationResult.error}`);
     }
-    
+    const safePath = validationResult.normalizedPath!;
+
     try {
-      const content = readFileSync(args.path, 'utf-8');
-      const stats = statSync(args.path);
-      const language = this.detectLanguage(args.path);
+      const content = readFileSync(safePath, 'utf-8');
+      const stats = statSync(safePath);
+      const language = this.detectLanguage(safePath);
       const lineCount = content.split('\n').length;
 
       // Perform semantic analysis using our Rust engine
-      const semanticConcepts = await this.semanticEngine.analyzeFileContent(args.path, content);
+      const semanticConcepts = await this.semanticEngine.analyzeFileContent(safePath, content);
 
       // Extract patterns using our pattern engine
-      const patterns = await this.patternEngine.analyzeFilePatterns(args.path, content);
+      const patterns = await this.patternEngine.analyzeFilePatterns(safePath, content);
 
       // Calculate detailed complexity metrics
       const complexity = this.calculateDetailedComplexity(content, semanticConcepts);
@@ -410,17 +383,17 @@ export class CoreAnalysisTools {
       if (error instanceof InMemoriaError) {
         throw error;
       }
-      
+
       // Convert to proper InMemoria error with MCP compliance
       const inMemoriaError = ErrorUtils.fromError(
         error instanceof Error ? error : new Error(String(error)),
         {
           operation: 'file-analysis',
-          filePath: args.path,
+          filePath: safePath,
           component: 'core-analysis-tools'
         }
       );
-      
+
       throw inMemoriaError;
     }
   }
@@ -473,16 +446,18 @@ export class CoreAnalysisTools {
     if (!args.path || typeof args.path !== 'string') {
       throw new Error('Path parameter is required and must be a string');
     }
-    
-    // Sanitize path and check for dangerous patterns
-    if (args.path.includes('..') || args.path.includes('\0')) {
-      throw new Error('Path contains invalid characters');
+
+    // Use unified path validation from PathValidator (security.ts integration)
+    const validationResult = PathValidator.validate(args.path, process.cwd(), { requireExists: true });
+    if (!validationResult.isValid) {
+      throw new Error(`Invalid path: ${validationResult.error}`);
     }
-    
+    const safePath = validationResult.normalizedPath!;
+
     const options = DocOptionsSchema.parse(args);
 
     // Use our intelligent analysis instead of basic codebase analysis
-    const intelligentAnalysis = await this.gatherIntelligentAnalysis(args.path);
+    const intelligentAnalysis = await this.gatherIntelligentAnalysis(safePath);
 
     const documentation = await this.buildIntelligentDocumentation(intelligentAnalysis, options);
 
@@ -497,7 +472,7 @@ export class CoreAnalysisTools {
   }
 
   private detectLanguage(filePath: string): string {
-    return detectLanguageFromPath(filePath);
+    return CoreUtils.detectLanguage(filePath);
   }
 
   private calculateDetailedComplexity(content: string, semanticConcepts: AnalyzedConcept[]): {
@@ -714,16 +689,7 @@ export class CoreAnalysisTools {
   }
 
   private shouldIgnoreDirectory(name: string): boolean {
-    const ignoredDirs = [
-      'node_modules', '.git', '.svn', '.hg',
-      'target', 'dist', 'build', '.next',
-      '__pycache__', '.pytest_cache',
-      '.vscode', '.idea', '.DS_Store',
-      'coverage', '.nyc_output',
-      'logs', '*.log'
-    ];
-
-    return ignoredDirs.includes(name) || name.startsWith('.');
+    return CoreUtils.shouldIgnoreDirectory(name);
   }
 
   private calculateStructureSummary(structure: DirectoryStructureNode | null): {
@@ -852,7 +818,7 @@ export class CoreAnalysisTools {
         searchType: 'semantic'
       };
     } catch (error: unknown) {
-      console.error('Semantic search error:', error);
+      Logger.error('Semantic search error', error instanceof Error ? error : new Error(String(error)));
       return {
         results: [],
         totalFound: 0,
@@ -934,7 +900,7 @@ export class CoreAnalysisTools {
         searchType: 'pattern'
       };
     } catch (error: unknown) {
-      console.error('Pattern search error:', error);
+      Logger.error('Pattern search error', error instanceof Error ? error : new Error(String(error)));
       return {
         results: [],
         totalFound: 0,
@@ -1013,7 +979,7 @@ export class CoreAnalysisTools {
         searchType: 'text'
       };
     } catch (error: unknown) {
-      console.error('Text search error:', error);
+      Logger.error('Text search error', error instanceof Error ? error : new Error(String(error)));
       return {
         results: [],
         totalFound: 0,
@@ -1024,23 +990,7 @@ export class CoreAnalysisTools {
   }
 
   private getFileExtensionsForLanguage(language: string): string {
-    const extensions: Record<string, string> = {
-      'typescript': 'ts,tsx',
-      'javascript': 'js,jsx',
-      'python': 'py',
-      'rust': 'rs',
-      'go': 'go',
-      'java': 'java',
-      'cpp': 'cpp,cc,cxx,hpp,h',
-      'c': 'c,h',
-      'csharp': 'cs',
-      'php': 'php',
-      'ruby': 'rb',
-      'swift': 'swift',
-      'kotlin': 'kt'
-    };
-
-    return extensions[language.toLowerCase()] || 'ts,js,py,rs';
+    return CoreUtils.getFileExtensionsForLanguage(language);
   }
 
   private matchesPattern(content: string, patternType: string, exampleCode: string): boolean {
@@ -1100,7 +1050,7 @@ export class CoreAnalysisTools {
   private async gatherIntelligentAnalysis(path: string) {
     try {
       // Use our actual intelligent engines
-      console.log('🔍 Gathering intelligent analysis...');
+      Logger.info('Gathering intelligent analysis', { path });
 
       // Get codebase analysis using our semantic engine
       const codebaseAnalysis = await this.semanticEngine.analyzeCodebase(path);
@@ -1133,13 +1083,17 @@ export class CoreAnalysisTools {
         analysisTimestamp: new Date()
       };
     } catch (error: unknown) {
-      console.error('❌ Intelligence gathering encountered errors:', error);
-      console.warn('🔄 Returning degraded analysis results:');
-      console.warn('   • Semantic analysis engines unavailable');
-      console.warn('   • Pattern detection failed');  
-      console.warn('   • Code complexity measurement not possible');
-      console.warn('   • Documentation will include limited information');
-      console.warn(`   • Analysis reliability severely compromised for: ${path}`);
+      Logger.error('Intelligence gathering encountered errors', error instanceof Error ? error : new Error(String(error)), { path });
+      Logger.warn('Returning degraded analysis results', {
+        path,
+        limitations: [
+          'Semantic analysis engines unavailable',
+          'Pattern detection failed',
+          'Code complexity measurement not possible',
+          'Documentation will include limited information',
+          'Analysis reliability severely compromised'
+        ]
+      });
       
       // Return degraded results but clearly mark them as such
       return {

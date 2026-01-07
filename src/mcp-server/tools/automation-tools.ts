@@ -4,8 +4,10 @@ import { PatternEngine } from '../../engines/pattern-engine.js';
 import { SQLiteDatabase } from '../../storage/sqlite-db.js';
 import { ProgressTracker } from '../../utils/progress-tracker.js';
 import { ConsoleProgressRenderer } from '../../utils/console-progress.js';
-import { glob } from 'glob';
+import { CoreAnalysisTools as CoreUtils } from './core-analysis-tools.js';
+import { Logger } from '../../utils/logger.js';
 import { statSync, existsSync } from 'fs';
+import { glob } from 'glob';
 
 export class AutomationTools {
   constructor(
@@ -49,39 +51,6 @@ export class AutomationTools {
           }
         }
       }
-      // DEPRECATED (Phase 4): Merged into get_project_blueprint - returns learning status in blueprint
-      // {
-      //   name: 'get_learning_status',
-      //   description: 'Get the current learning/intelligence status of the codebase',
-      //   inputSchema: {
-      //     type: 'object',
-      //     properties: {
-      //       path: {
-      //         type: 'string',
-      //         description: 'Path to check (defaults to current working directory)'
-      //       }
-      //     }
-      //   }
-      // },
-      // DEPRECATED (Phase 4): Merged into auto_learn_if_needed - same functionality
-      // {
-      //   name: 'quick_setup',
-      //   description: 'Perform quick setup and learning for immediate use by AI agents',
-      //   inputSchema: {
-      //     type: 'object',
-      //     properties: {
-      //       path: {
-      //         type: 'string',
-      //         description: 'Path to the project directory'
-      //       },
-      //       skipLearning: {
-      //         type: 'boolean',
-      //         description: 'Skip the learning phase for faster setup',
-      //         default: false
-      //       }
-      //     }
-      //   }
-      // }
     ];
   }
 
@@ -108,7 +77,7 @@ export class AutomationTools {
     }> | undefined = includeSetupSteps ? [] : undefined;
 
     if (includeSetupSteps) {
-      console.error(`🚀 Quick setup for: ${projectPath}`);
+      Logger.info('Quick setup started', { projectPath });
 
       // Step 1: Project check
       const files = await this.countProjectFiles(projectPath);
@@ -130,7 +99,7 @@ export class AutomationTools {
         }
       });
     } else {
-      console.error(`\n🚀 Quick setup for: ${projectPath}`);
+      Logger.info('Quick setup started', { projectPath });
     }
 
     // Don't show progress bars yet - wait until we actually start learning
@@ -220,8 +189,7 @@ export class AutomationTools {
       tracker.addPhase('pattern_learning', files.codeFiles, 2);
       tracker.addPhase('indexing', files.codeFiles, 1);
 
-      console.error(`\n🧠 Starting intelligent learning...`);
-      console.error('━'.repeat(60) + '\n');
+      Logger.info('Starting intelligent learning', { projectPath, codeFiles: files.codeFiles });
 
       // Start the progress renderer which shows all phases
       if (includeProgress) {
@@ -268,7 +236,7 @@ export class AutomationTools {
         const analysisTime = Date.now() - analysisStart;
 
         if (analysisTime > 120000) { // More than 2 minutes
-          console.error(`\n⚠️  Semantic analysis took ${Math.round(analysisTime / 1000)}s. Consider excluding large generated files.`);
+          Logger.warn('Semantic analysis took longer than expected. Consider excluding large generated files.', { analysisTimeSeconds: Math.round(analysisTime / 1000) });
         }
       } catch (error) {
         tracker.complete('semantic_analysis');
@@ -304,14 +272,13 @@ export class AutomationTools {
 
       // Print final summary (without duplicate completion message)
       const totalTime = Date.now() - tracker.getProgress()!.startTime;
-      const separator = '━'.repeat(60);
 
-      console.error(`${separator}`);
-      console.error(`📊 Concepts:  ${concepts.length.toLocaleString()}`);
-      console.error(`🔍 Patterns:  ${patterns.length.toLocaleString()}`);
-      console.error(`📁 Files:     ${files.codeFiles.toLocaleString()}`);
-      console.error(`⏱️  Time:      ${this.formatDuration(totalTime)}`);
-      console.error(separator);
+      Logger.info('Learning completed', {
+        conceptsLearned: concepts.length,
+        patternsLearned: patterns.length,
+        filesAnalyzed: files.codeFiles,
+        timeElapsed: this.formatDuration(totalTime)
+      });
 
       // Phase 4: Handle setup steps from quick_setup
       if (includeSetupSteps) {
@@ -369,7 +336,7 @@ export class AutomationTools {
 
     } catch (error: unknown) {
       progressRenderer.stop();
-      console.error('❌ Auto-learning failed:', error);
+      Logger.error('Auto-learning failed', error instanceof Error ? error : new Error(String(error)));
 
       // Phase 4: Handle setup steps failure
       if (includeSetupSteps) {
@@ -412,7 +379,7 @@ export class AutomationTools {
           // Don't call cleanup on shared engines - just ensure no hanging operations
           // The cleanup will be handled when the MCP server shuts down
         } catch (error) {
-          console.warn('Warning: Issue during resource cleanup:', error);
+          Logger.warn('Issue during resource cleanup', { error: error instanceof Error ? error.message : String(error) });
         }
       }
     }
@@ -468,7 +435,7 @@ export class AutomationTools {
     const projectPath = args.path || process.cwd();
     const skipLearning = args.skipLearning || false;
 
-    console.error(`🚀 Quick setup for: ${projectPath}`);
+    Logger.info('Quick setup started', { projectPath });
 
     const steps = [];
     let success = true;
@@ -540,7 +507,7 @@ export class AutomationTools {
       };
 
     } catch (error: unknown) {
-      console.error('❌ Quick setup failed:', error);
+      Logger.error('Quick setup failed', error instanceof Error ? error : new Error(String(error)));
 
       steps.push({
         step: 'error',
@@ -562,93 +529,10 @@ export class AutomationTools {
 
   private async countProjectFiles(path: string): Promise<{ total: number; codeFiles: number }> {
     try {
-      const allFiles = await glob('**/*', {
-        cwd: path,
-        ignore: [
-          // Package managers and dependencies
-          '**/node_modules/**',
-          '**/bower_components/**',
-          '**/jspm_packages/**',
-          '**/vendor/**',
-
-          // Version control
-          '**/.git/**',
-          '**/.svn/**',
-          '**/.hg/**',
-
-          // Build outputs and artifacts
-          '**/dist/**',
-          '**/build/**',
-          '**/out/**',
-          '**/output/**',
-          '**/target/**',
-          '**/bin/**',
-          '**/obj/**',
-          '**/Debug/**',
-          '**/Release/**',
-
-          // Framework-specific build directories
-          '**/.next/**',
-          '**/.nuxt/**',
-          '**/.svelte-kit/**',
-          '**/.vitepress/**',
-          '**/_site/**',
-
-          // Static assets and public files
-          '**/public/**',
-          '**/static/**',
-          '**/assets/**',
-
-          // Testing and coverage
-          '**/coverage/**',
-          '**/.coverage/**',
-          '**/htmlcov/**',
-          '**/.pytest_cache/**',
-          '**/.nyc_output/**',
-          '**/nyc_output/**',
-          '**/lib-cov/**',
-
-          // Python environments and cache
-          '**/__pycache__/**',
-          '**/.venv/**',
-          '**/venv/**',
-          '**/env/**',
-          '**/.env/**',
-
-          // Temporary and cache directories
-          '**/tmp/**',
-          '**/temp/**',
-          '**/.tmp/**',
-          '**/cache/**',
-          '**/.cache/**',
-          '**/logs/**',
-          '**/.logs/**',
-
-          // Generated/minified files
-          '**/*.min.js',
-          '**/*.min.css',
-          '**/*.bundle.js',
-          '**/*.chunk.js',
-          '**/*.map',
-
-          // Lock files
-          '**/package-lock.json',
-          '**/yarn.lock',
-          '**/Cargo.lock',
-          '**/Gemfile.lock',
-          '**/Pipfile.lock',
-          '**/poetry.lock'
-        ],
-        nodir: true
-      });
-
-      const codeFiles = allFiles.filter(file =>
-        /\.(ts|tsx|js|jsx|py|rs|go|java|c|cpp|h|hpp|svelte|vue)$/.test(file)
-      );
-
+      const result = await CoreUtils.countFiles(path);
       return {
-        total: allFiles.length,
-        codeFiles: codeFiles.length
+        total: result.total,
+        codeFiles: result.codeFiles
       };
     } catch (error) {
       return { total: 0, codeFiles: 0 };
@@ -743,7 +627,7 @@ export class AutomationTools {
 
     } catch (error) {
       // If we can't determine staleness, err on the side of caution and assume not stale
-      console.warn('Failed to detect staleness:', error);
+      Logger.warn('Failed to detect staleness', { error: error instanceof Error ? error.message : String(error) });
       return false;
     }
   }
@@ -805,7 +689,7 @@ export class AutomationTools {
 
       return mostRecentTime > 0 ? mostRecentTime : null;
     } catch (error) {
-      console.warn('Failed to get file modification times:', error);
+      Logger.warn('Failed to get file modification times', { error: error instanceof Error ? error.message : String(error) });
       return null;
     }
   }

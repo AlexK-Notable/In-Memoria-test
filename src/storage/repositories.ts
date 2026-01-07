@@ -14,6 +14,7 @@
  */
 
 import { escapeLikePattern } from '../utils/security.js';
+import { Logger } from '../utils/logger.js';
 
 // ============================================================================
 // Helper Functions
@@ -30,7 +31,7 @@ function safeParseJSON(jsonString: string | null | undefined): Record<string, un
   try {
     return JSON.parse(jsonString);
   } catch {
-    console.error('Failed to parse JSON metadata:', jsonString.substring(0, 100));
+    Logger.error('Failed to parse JSON metadata', new Error('JSON parse error'), { preview: jsonString.substring(0, 100) });
     return {};
   }
 }

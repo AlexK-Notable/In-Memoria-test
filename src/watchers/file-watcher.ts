@@ -1,9 +1,11 @@
 import * as chokidar from 'chokidar';
 import { EventEmitter } from 'eventemitter3';
 import { createHash } from 'crypto';
-import { readFileSync, statSync } from 'fs';
+import { readFile, stat } from 'fs/promises';
 import { extname } from 'path';
 import { detectLanguageFromPath } from '../utils/language-registry.js';
+import { withRetry, RetryPresets } from '../utils/retry.js';
+import { Logger } from '../utils/logger.js';
 
 export interface FileChange {
   type: 'add' | 'change' | 'unlink' | 'addDir' | 'unlinkDir';
@@ -218,13 +220,24 @@ export class FileWatcher extends EventEmitter {
     // For file operations (not directories), add content and metadata
     if (type !== 'unlinkDir' && type !== 'addDir') {
       try {
-        const actualStats = stats || statSync(path);
-        
+        // Wrap stat operation with retry for transient file system issues
+        // (network mounts, file locks, etc.)
+        const actualStats = stats || await withRetry(
+          async () => stat(path),
+          RetryPresets.fast, // Fast retries for local file system
+          'FileWatcher.stat'
+        );
+
         if (!actualStats.isDirectory()) {
           change.language = detectLanguageFromPath(path);
-          
+
           if (this.options.includeContent && this.isTextFile(path)) {
-            change.content = readFileSync(path, 'utf-8');
+            // Wrap file read with retry for transient failures
+            change.content = await withRetry(
+              async () => readFile(path, 'utf-8'),
+              RetryPresets.fast,
+              'FileWatcher.readFile'
+            );
             change.hash = this.calculateHash(change.content);
           } else if (!this.options.includeContent) {
             // Calculate hash from file stats for binary files or when content is disabled
@@ -275,7 +288,7 @@ export class FileWatcher extends EventEmitter {
     if (this.watcher) {
       // Note: chokidar doesn't support dynamic ignore pattern updates
       // This would require restarting the watcher
-      console.warn('Dynamic ignore pattern updates require restarting the watcher');
+      Logger.warn('Dynamic ignore pattern updates require restarting the watcher');
     }
   }
 

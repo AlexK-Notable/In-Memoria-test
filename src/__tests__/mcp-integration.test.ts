@@ -74,7 +74,15 @@ export function formatMessage(message: string): string {
   describe('Server Initialization', () => {
     it('should initialize all components successfully', async () => {
       // Initialization happens in constructor, should not throw
-      expect(server).toBeDefined();
+      expect(server).toBeInstanceOf(CodeCartographerMCP);
+      expect(server.getAllTools()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: expect.any(String),
+            description: expect.any(String),
+          })
+        ])
+      );
     });
   });
 
@@ -84,9 +92,10 @@ export function formatMessage(message: string): string {
         path: projectDir
       });
 
-      expect(result).toBeDefined();
-      expect(typeof result).toBe('object');
-      // The actual structure depends on the Rust analyzer, but should be an object
+      expect(result).toMatchObject({
+        type: expect.stringMatching(/^(directory|file|codebase)$/),
+      });
+      // The actual structure depends on the Rust analyzer, but should have basic properties
     });
 
     it('should analyze a single file', async () => {
@@ -94,9 +103,10 @@ export function formatMessage(message: string): string {
         path: join(projectDir, 'index.ts')
       });
 
-      expect(result).toBeDefined();
-      expect(result.type).toBe('file');
-      expect(result.language).toBeDefined();
+      expect(result).toMatchObject({
+        type: 'file',
+        language: expect.any(String),
+      });
     });
 
     it('should get project blueprint', async () => {
@@ -105,9 +115,14 @@ export function formatMessage(message: string): string {
         includeFeatureMap: true
       });
 
-      expect(Array.isArray(result.techStack)).toBe(true);
-      expect(result.learningStatus).toBeDefined();
-      expect(result.keyDirectories).toBeDefined();
+      expect(result).toMatchObject({
+        techStack: expect.any(Array),
+        learningStatus: expect.objectContaining({
+          recommendation: expect.stringMatching(/ready|learning_recommended|learning_needed/),
+        }),
+      });
+      // keyDirectories can be an array or object depending on learning status
+      expect(result.keyDirectories !== undefined).toBe(true);
     });
 
     it('should search codebase', async () => {
@@ -116,8 +131,11 @@ export function formatMessage(message: string): string {
         type: 'text'
       });
 
-      expect(result).toBeDefined();
-      // Should find the TestService class
+      // Result should be an array of matches or an object with matches
+      expect(result).toEqual(
+        expect.objectContaining({})
+      );
+      // Search result structure varies but should be a valid response object
     });
   });
 
@@ -127,8 +145,11 @@ export function formatMessage(message: string): string {
         path: projectDir
       });
 
-      expect(result.learningStatus).toBeDefined();
-      expect(result.learningStatus.recommendation).toMatch(/ready|learning_recommended|learning_needed/);
+      expect(result).toMatchObject({
+        learningStatus: expect.objectContaining({
+          recommendation: expect.stringMatching(/ready|learning_recommended|learning_needed/),
+        }),
+      });
     });
 
     it('should auto-learn if needed', async () => {
@@ -151,9 +172,12 @@ export function formatMessage(message: string): string {
         includeSetupSteps: true
       });
 
-      expect(result.success || result.action).toBeDefined();
-      expect(Array.isArray(result.steps)).toBe(true);
-      expect(result.steps.length).toBeGreaterThan(0);
+      expect(result).toMatchObject({
+        steps: expect.arrayContaining([
+          expect.objectContaining({})
+        ]),
+      });
+      expect(result.success !== undefined || result.action !== undefined).toBe(true);
     });
   });
 
@@ -163,11 +187,17 @@ export function formatMessage(message: string): string {
         includeMetrics: true
       });
 
-      expect(result.success).toBe(true);
-      expect(result.status.version).toBe('0.6.0');
-      expect(result.status.components.database).toBeDefined();
-      expect(result.status.intelligence).toBeDefined();
-      expect(result.status.status).toMatch(/operational|ready_for_learning|degraded|critical/);
+      expect(result).toMatchObject({
+        success: true,
+        status: expect.objectContaining({
+          version: '0.6.0',
+          status: expect.stringMatching(/operational|ready_for_learning|degraded|critical/),
+          components: expect.objectContaining({
+            database: expect.any(Object),
+          }),
+          intelligence: expect.any(Object),
+        }),
+      });
     });
 
     it('should get intelligence metrics', async () => {
@@ -175,9 +205,17 @@ export function formatMessage(message: string): string {
         includeBreakdown: true
       });
 
-      expect(result.success).toBe(true);
-      expect(typeof result.metrics.concepts.total).toBe('number');
-      expect(typeof result.metrics.patterns.total).toBe('number');
+      expect(result).toMatchObject({
+        success: true,
+        metrics: expect.objectContaining({
+          concepts: expect.objectContaining({
+            total: expect.any(Number),
+          }),
+          patterns: expect.objectContaining({
+            total: expect.any(Number),
+          }),
+        }),
+      });
     });
 
     it('should get performance status', async () => {
@@ -185,10 +223,15 @@ export function formatMessage(message: string): string {
         runBenchmark: false
       });
 
-      expect(result.success).toBe(true);
-      expect(result.performance.memory).toBeDefined();
-      expect(result.performance.system).toBeDefined();
-      expect(typeof result.performance.memory.heapUsed).toBe('number');
+      expect(result).toMatchObject({
+        success: true,
+        performance: expect.objectContaining({
+          memory: expect.objectContaining({
+            heapUsed: expect.any(Number),
+          }),
+          system: expect.any(Object),
+        }),
+      });
     });
 
     it('should run performance benchmark', async () => {
@@ -196,9 +239,14 @@ export function formatMessage(message: string): string {
         runBenchmark: true
       });
 
-      expect(result.success).toBe(true);
-      expect(result.performance.benchmark).toBeDefined();
-      expect(typeof result.performance.benchmark.conceptQuery).toBe('number');
+      expect(result).toMatchObject({
+        success: true,
+        performance: expect.objectContaining({
+          benchmark: expect.objectContaining({
+            conceptQuery: expect.any(Number),
+          }),
+        }),
+      });
     });
   });
 
@@ -208,8 +256,9 @@ export function formatMessage(message: string): string {
         limit: 10
       });
 
-      expect(result).toBeDefined();
-      // Result structure depends on available intelligence data
+      // Result structure depends on available intelligence data but should be an object
+      expect(typeof result).toBe('object');
+      expect(result).not.toBeNull();
     });
 
     it('should get pattern recommendations', async () => {
@@ -217,8 +266,9 @@ export function formatMessage(message: string): string {
         problemDescription: 'I need to create a data processing service'
       });
 
-      expect(result).toBeDefined();
-      // Should provide some kind of recommendation
+      // Should return an object with recommendation info
+      expect(typeof result).toBe('object');
+      expect(result).not.toBeNull();
     });
 
     it('should predict coding approach', async () => {
@@ -226,15 +276,17 @@ export function formatMessage(message: string): string {
         problemDescription: 'Building a REST API endpoint'
       });
 
-      expect(result).toBeDefined();
-      // Should provide approach prediction
+      // Should return an object with approach prediction
+      expect(typeof result).toBe('object');
+      expect(result).not.toBeNull();
     });
 
     it('should get developer profile', async () => {
       const result = await server.routeToolCall('get_developer_profile', {});
 
-      expect(result).toBeDefined();
       // Profile information based on learned patterns
+      expect(typeof result).toBe('object');
+      expect(result).not.toBeNull();
     });
 
     it('should accept insights contribution', async () => {
@@ -245,8 +297,9 @@ export function formatMessage(message: string): string {
         sourceAgent: 'test-agent'
       });
 
-      expect(result).toBeDefined();
-      // Should accept the insight
+      // Should accept the insight and return confirmation
+      expect(typeof result).toBe('object');
+      expect(result).not.toBeNull();
     });
   });
 
@@ -306,7 +359,8 @@ export function formatMessage(message: string): string {
 
       for (const { name, params } of toolsWithValidParams) {
         const result = await server.routeToolCall(name, params);
-        expect(result).toBeDefined();
+        expect(typeof result).toBe('object');
+        expect(result).not.toBeNull();
       }
     });
   });
@@ -317,28 +371,39 @@ export function formatMessage(message: string): string {
       const initialStatus = await server.routeToolCall('get_project_blueprint', {
         path: projectDir
       });
-      expect(initialStatus.learningStatus).toBeDefined();
+      expect(initialStatus).toMatchObject({
+        learningStatus: expect.any(Object),
+      });
 
       // 2. Auto-learn if needed
       const learningResult = await server.routeToolCall('auto_learn_if_needed', {
         path: projectDir,
         includeProgress: false
       });
-      expect(learningResult.action).toBeDefined();
+      expect(learningResult).toMatchObject({
+        action: expect.stringMatching(/skipped|learned|failed/),
+      });
 
       // 3. Get system status after learning
       const systemStatus = await server.routeToolCall('get_system_status', {});
-      expect(systemStatus.success).toBe(true);
+      expect(systemStatus).toMatchObject({
+        success: true,
+        status: expect.any(Object),
+      });
 
       // 4. Get intelligence metrics
       const metrics = await server.routeToolCall('get_intelligence_metrics', {});
-      expect(metrics.success).toBe(true);
+      expect(metrics).toMatchObject({
+        success: true,
+        metrics: expect.any(Object),
+      });
 
       // 5. Analyze the codebase
       const analysis = await server.routeToolCall('analyze_codebase', {
         path: projectDir
       });
-      expect(analysis).toBeDefined();
+      expect(typeof analysis).toBe('object');
+      expect(analysis).not.toBeNull();
 
       // Complete workflow should work without errors
     });

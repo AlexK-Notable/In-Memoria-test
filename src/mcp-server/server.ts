@@ -4,6 +4,9 @@ import {
   CallToolRequestSchema,
   ErrorCode,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ReadResourceRequestSchema,
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 
@@ -21,6 +24,7 @@ import { Logger } from '../utils/logger.js';
 import { shutdownManager } from '../utils/shutdown-manager.js';
 import { ToolRegistry } from './tool-registry.js';
 import { createConfiguredRegistry } from './tool-definitions.js';
+import { InMemoriaResourceHandler, RESOURCE_TEMPLATES } from './resources.js';
 
 export class CodeCartographerMCP {
   private server: Server;
@@ -33,6 +37,7 @@ export class CodeCartographerMCP {
   private automationTools!: AutomationTools;
   private monitoringTools!: MonitoringTools;
   private toolRegistry!: ToolRegistry;
+  private resourceHandler!: InMemoriaResourceHandler;
 
   constructor() {
     this.server = new Server(
@@ -43,6 +48,7 @@ export class CodeCartographerMCP {
       {
         capabilities: {
           tools: {},
+          resources: {},
         },
       }
     );
@@ -107,6 +113,10 @@ export class CodeCartographerMCP {
       const stats = this.toolRegistry.getStats();
       Logger.info(`Tool registry initialized: ${stats.totalTools} tools in ${stats.categories.length} categories`);
 
+      // Initialize resource handler for MCP resources
+      this.resourceHandler = new InMemoriaResourceHandler(this.database);
+      Logger.info('Resource handler initialized');
+
       Logger.info('In Memoria components initialized successfully');
     } catch (error: unknown) {
       Logger.error('Failed to initialize In Memoria components:', error);
@@ -165,6 +175,40 @@ export class CodeCartographerMCP {
         );
       }
     });
+
+    // List available resources
+    this.server.setRequestHandler(ListResourcesRequestSchema, async () => {
+      const resources = await this.resourceHandler.listResources();
+      return { resources };
+    });
+
+    // List resource templates for dynamic resources
+    this.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
+      return { resourceTemplates: RESOURCE_TEMPLATES };
+    });
+
+    // Read a specific resource
+    this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+      const { uri } = request.params;
+
+      try {
+        const result = await this.resourceHandler.readResource(uri);
+        return {
+          contents: [
+            {
+              uri: result.uri,
+              mimeType: result.mimeType,
+              text: result.text,
+            }
+          ]
+        };
+      } catch (error) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Failed to read resource: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    });
   }
 
   public async routeToolCall(name: string, args: any): Promise<any> {
@@ -212,6 +256,13 @@ export class CodeCartographerMCP {
   }
 
   /**
+   * Get the resource handler (for testing and introspection)
+   */
+  getResourceHandler(): InMemoriaResourceHandler {
+    return this.resourceHandler;
+  }
+
+  /**
    * Initialize components for testing without starting transport
    */
   async initializeForTesting(): Promise<void> {
@@ -229,7 +280,7 @@ export class CodeCartographerMCP {
       try {
         await this.vectorDB.close();
       } catch (error) {
-        console.warn('Warning: Failed to close vector database:', error);
+        Logger.warn('Failed to close vector database', { error: error instanceof Error ? error.message : String(error) });
       }
     }
 

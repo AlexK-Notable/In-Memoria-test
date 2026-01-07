@@ -7,7 +7,7 @@ import { dirname } from 'path';
 import { PathValidator } from '../../utils/path-validator.js';
 import { config } from '../../config/config.js';
 import { Logger } from '../../utils/logger.js';
-import { detectLanguageFromPath } from '../../utils/language-registry.js';
+import { CoreAnalysisTools as CoreUtils } from './core-analysis-tools.js';
 
 export class MonitoringTools {
   constructor(
@@ -298,7 +298,7 @@ export class MonitoringTools {
 
       if (concepts.length > 0) {
         conceptsByLanguage = concepts.reduce<Record<string, number>>((acc, concept) => {
-          const language = detectLanguageFromPath(concept.filePath);
+          const language = CoreUtils.detectLanguage(concept.filePath);
           if (!acc[language]) {
             acc[language] = 0;
           }

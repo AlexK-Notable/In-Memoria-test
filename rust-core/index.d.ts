@@ -104,6 +104,13 @@ export declare class PatternLearner {
    * pattern update operations that are inherently safe but marked unsafe for JavaScript interop.
    */
   updateFromChange(changeData: string): Promise<boolean>
+  /**
+   * Clear all accumulated state to free memory
+   * Call this between analysis sessions to prevent unbounded memory growth
+   */
+  reset(): void
+  /** Get current memory usage statistics for monitoring */
+  getStats(): LearnerStats
 }
 
 /** Core learning engine that orchestrates pattern discovery across all domains */
@@ -137,6 +144,13 @@ export declare class PatternLearningEngine {
   analyzePatterns(concepts: Array<SemanticConcept>): PatternAnalysisResult
   /** Predict best approach for a problem */
   predictApproach(problemDescription: string, context?: string | undefined | null): ApproachPrediction
+  /**
+   * Clear all accumulated state to free memory
+   * Call this between analysis sessions to prevent unbounded memory growth
+   */
+  reset(): void
+  /** Get current memory usage statistics for monitoring */
+  getStats(): LearnerStats
   /**
    * Updates patterns based on file changes (from original implementation)
    *
@@ -189,11 +203,26 @@ export declare class SemanticAnalyzer {
   updateFromAnalysis(analysisData: string): Promise<boolean>
   /** Get concept relationships for a specific concept ID (from original implementation) */
   getConceptRelationships(conceptId: string): Array<string>
+  /**
+   * Clear all accumulated state to free memory
+   * Call this between analysis sessions to prevent unbounded memory growth
+   */
+  reset(): void
+  /** Get current memory usage statistics for monitoring */
+  getStats(): AnalyzerStats
 }
 
 /** Analyzer for detecting architectural and structural patterns */
 export declare class StructuralPatternAnalyzer {
   constructor()
+}
+
+/** Statistics about the analyzer's accumulated state */
+export interface AnalyzerStats {
+  /** Number of semantic concepts currently stored */
+  conceptsCount: number
+  /** Number of relationship mappings currently stored */
+  relationshipsCount: number
 }
 
 /** Prediction of coding approach based on patterns */
@@ -265,6 +294,16 @@ export interface KeyDirectory {
   path: string
   dirType: string
   fileCount: number
+}
+
+/** Statistics about the pattern learner's accumulated state */
+export interface LearnerStats {
+  /** Number of patterns currently stored */
+  patternsCount: number
+  /** Total patterns learned across all sessions */
+  totalPatternsLearned: number
+  /** Current confidence threshold setting */
+  confidenceThreshold: number
 }
 
 export interface LineRange {

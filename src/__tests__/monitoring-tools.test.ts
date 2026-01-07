@@ -38,13 +38,19 @@ describe('MonitoringTools', () => {
         includeDiagnostics: true
       });
 
-      expect(result.success).toBe(true);
-      expect(result.status.version).toBe('0.6.0');
-      expect(result.status.timestamp).toBeDefined();
-      expect(result.status.components.database).toBeDefined();
-      expect(result.status.intelligence).toBeDefined();
-      expect(result.status.performance).toBeDefined();
-      expect(result.status.diagnostics).toBeDefined();
+      expect(result).toMatchObject({
+        success: true,
+        status: expect.objectContaining({
+          version: '0.6.0',
+          timestamp: expect.any(String),
+          components: expect.objectContaining({
+            database: expect.any(Object),
+          }),
+          intelligence: expect.any(Object),
+          performance: expect.any(Object),
+          diagnostics: expect.any(Object),
+        }),
+      });
     });
 
     it('should handle minimal status request', async () => {
@@ -61,9 +67,13 @@ describe('MonitoringTools', () => {
     it('should assess overall health correctly', async () => {
       const result = await monitoringTools.getSystemStatus({});
 
-      expect(result.status.status).toMatch(/operational|ready_for_learning|degraded|critical/);
-      expect(result.message).toContain('System is');
-      expect(result.summary).toBeDefined();
+      expect(result).toMatchObject({
+        status: expect.objectContaining({
+          status: expect.stringMatching(/operational|ready_for_learning|degraded|critical/),
+        }),
+        message: expect.stringContaining('System is'),
+        summary: expect.any(String),
+      });
     });
   });
 
@@ -133,20 +143,34 @@ describe('MonitoringTools', () => {
         runBenchmark: false
       });
 
-      expect(result.success).toBe(true);
-      expect(result.performance.memory).toBeDefined();
+      expect(result).toMatchObject({
+        success: true,
+        performance: expect.objectContaining({
+          memory: expect.objectContaining({
+            heapUsed: expect.any(Number),
+          }),
+          system: expect.objectContaining({
+            nodeVersion: expect.any(String),
+            platform: expect.any(String),
+          }),
+        }),
+      });
       expect(result.performance.memory.heapUsed).toBeGreaterThan(0);
-      expect(result.performance.system.nodeVersion).toBeDefined();
-      expect(result.performance.system.platform).toBeDefined();
     });
 
     it('should include database performance metrics', async () => {
       const result = await monitoringTools.getPerformanceStatus({});
 
-      expect(result.success).toBe(true);
-      expect(result.performance.database).toBeDefined();
-      expect(result.performance.database.queryPerformance).toBeDefined();
-      expect(result.performance.database.queryPerformance.performanceRating).toMatch(/excellent|good|fair|poor/);
+      expect(result).toMatchObject({
+        success: true,
+        performance: expect.objectContaining({
+          database: expect.objectContaining({
+            queryPerformance: expect.objectContaining({
+              performanceRating: expect.stringMatching(/excellent|good|fair|poor/),
+            }),
+          }),
+        }),
+      });
     });
 
     it('should run benchmark when requested', async () => {
@@ -154,8 +178,15 @@ describe('MonitoringTools', () => {
         runBenchmark: true
       });
 
-      expect(result.success).toBe(true);
-      expect(result.performance.benchmark).toBeDefined();
+      expect(result).toMatchObject({
+        success: true,
+        performance: expect.objectContaining({
+          benchmark: expect.objectContaining({
+            conceptQuery: expect.any(Number),
+            patternQuery: expect.any(Number),
+          }),
+        }),
+      });
       expect(result.performance.benchmark.conceptQuery).toBeGreaterThanOrEqual(0);
       expect(result.performance.benchmark.patternQuery).toBeGreaterThanOrEqual(0);
     });
@@ -175,8 +206,13 @@ describe('MonitoringTools', () => {
 
       // Verify all tools have proper schemas
       tools.forEach(tool => {
-        expect(tool.inputSchema).toBeDefined();
-        expect(tool.description).toBeDefined();
+        expect(tool).toMatchObject({
+          name: expect.any(String),
+          description: expect.any(String),
+          inputSchema: expect.objectContaining({
+            type: 'object',
+          }),
+        });
       });
     });
   });
