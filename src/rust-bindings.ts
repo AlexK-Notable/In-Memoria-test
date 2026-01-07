@@ -1,5 +1,6 @@
 // Platform-specific binary loading
 import { createRequire } from 'module';
+import { Logger } from './utils/logger.js';
 
 const require = createRequire(import.meta.url);
 
@@ -9,9 +10,7 @@ function loadNativeBinary() {
     try {
       return require(process.env.NAPI_RS_NATIVE_LIBRARY_PATH);
     } catch (error) {
-      console.error(
-        `[RUST-BINDINGS WARN] Failed to load from NAPI_RS_NATIVE_LIBRARY_PATH: ${error}`
-      );
+      Logger.warn('Failed to load from NAPI_RS_NATIVE_LIBRARY_PATH', { error: String(error) });
       // Fall through to platform detection below
     }
   }

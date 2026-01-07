@@ -1,4 +1,18 @@
 //! Main semantic analysis orchestration
+//!
+//! ## Thread Safety
+//!
+//! [`SemanticAnalyzer`] is exposed to JavaScript via NAPI bindings. Thread safety
+//! is handled by NAPI's event loop serialization - all JavaScript calls to a single
+//! instance are processed sequentially.
+//!
+//! **Key points:**
+//! - Different instances are independent and can be used concurrently from JS
+//! - All methods use `&mut self` (exclusive mutable access)
+//! - Internal state (`concepts`, `relationships`) is NOT protected by Mutex
+//! - Do NOT share instances across Worker threads
+//!
+//! See `docs/FFI_THREAD_SAFETY.md` for detailed documentation.
 
 #[cfg(feature = "napi-bindings")]
 use napi_derive::napi;
@@ -12,7 +26,34 @@ use std::collections::HashMap;
 use walkdir::WalkDir;
 use std::fs;
 
-/// Main semantic analyzer that orchestrates concept extraction across languages
+/// Statistics about the analyzer's accumulated state
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "napi-bindings", napi(object))]
+pub struct AnalyzerStats {
+    /// Number of semantic concepts currently stored
+    pub concepts_count: u32,
+    /// Number of relationship mappings currently stored
+    pub relationships_count: u32,
+}
+
+/// Main semantic analyzer that orchestrates concept extraction across languages.
+///
+/// # Thread Safety
+///
+/// This type is NOT `Send` or `Sync`. It maintains internal mutable state
+/// (`concepts` and `relationships` HashMaps) without synchronization primitives.
+///
+/// Thread safety for JavaScript callers is provided by NAPI's event loop
+/// serialization - all calls from JavaScript to a single instance are
+/// processed sequentially.
+///
+/// **Safe usage patterns:**
+/// - Create separate instances for concurrent JavaScript operations
+/// - Always await async operations before calling `reset()`
+///
+/// **Unsafe usage patterns:**
+/// - Sharing instances across Worker threads
+/// - Calling `reset()` while async operations are pending
 #[cfg_attr(feature = "napi-bindings", napi)]
 pub struct SemanticAnalyzer {
     parser_manager: ParserManager,
@@ -147,6 +188,49 @@ impl SemanticAnalyzer {
             .get(&concept_id)
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// Clear all accumulated state to free memory.
+    ///
+    /// Call this between analysis sessions to prevent unbounded memory growth.
+    ///
+    /// # Thread Safety
+    ///
+    /// **NOT thread-safe**: Must NOT be called while any async operation
+    /// (e.g., `learn_from_codebase`, `analyze_codebase`) is in progress.
+    ///
+    /// Safe usage:
+    /// ```javascript
+    /// await analyzer.learnFromCodebase(path);
+    /// analyzer.reset(); // Safe: no pending operations
+    /// ```
+    ///
+    /// Unsafe usage:
+    /// ```javascript
+    /// const promise = analyzer.learnFromCodebase(path);
+    /// analyzer.reset(); // UNSAFE: operation in progress!
+    /// await promise;
+    /// ```
+    #[cfg_attr(feature = "napi-bindings", napi)]
+    pub fn reset(&mut self) {
+        self.concepts.clear();
+        self.relationships.clear();
+        // Note: parser_manager is stateless (parsers are reused, not accumulated)
+        // config is intentionally preserved as it's configuration, not accumulated state
+    }
+
+    /// Get current memory usage statistics for monitoring.
+    ///
+    /// # Thread Safety
+    ///
+    /// **Thread-safe**: Read-only operation that does not modify state.
+    /// Safe to call at any time.
+    #[cfg_attr(feature = "napi-bindings", napi)]
+    pub fn get_stats(&self) -> AnalyzerStats {
+        AnalyzerStats {
+            concepts_count: self.concepts.len() as u32,
+            relationships_count: self.relationships.len() as u32,
+        }
     }
 
     /// Parse file content with tree-sitter and extract concepts
@@ -802,21 +886,61 @@ mod tests {
     #[tokio::test]
     async fn test_fallback_extraction() {
         let mut analyzer = SemanticAnalyzer::new().unwrap();
-        
+
         // Test with a language that might not have full tree-sitter support
         // The system should fall back to regex-based extraction
         let content = "function calculate() { return 42; }";
         let result = unsafe {
             analyzer.analyze_file_content("test.unknown".to_string(), content.to_string()).await
         };
-        
+
         assert!(result.is_ok());
         let concepts = result.unwrap();
         assert!(!concepts.is_empty());
-        
+
         // Check that fallback extraction worked
         let concept = &concepts[0];
         assert!(!concept.name.is_empty());
         assert!(concept.confidence > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_semantic_analyzer_reset() {
+        let mut analyzer = SemanticAnalyzer::new().unwrap();
+
+        // Verify initial state is empty
+        let initial_stats = analyzer.get_stats();
+        assert_eq!(initial_stats.concepts_count, 0);
+        assert_eq!(initial_stats.relationships_count, 0);
+
+        // Analyze some content to accumulate state
+        let content = "export class UserService { getName() { return 'test'; } }";
+        let result = unsafe {
+            analyzer.analyze_file_content("test.ts".to_string(), content.to_string()).await
+        };
+        assert!(result.is_ok());
+
+        // Verify state was accumulated
+        let stats_before = analyzer.get_stats();
+        assert!(stats_before.concepts_count > 0, "Should have accumulated concepts");
+
+        // Reset the analyzer
+        analyzer.reset();
+
+        // Verify state was cleared
+        let stats_after = analyzer.get_stats();
+        assert_eq!(stats_after.concepts_count, 0, "Concepts should be cleared after reset");
+        assert_eq!(stats_after.relationships_count, 0, "Relationships should be cleared after reset");
+    }
+
+    #[test]
+    fn test_analyzer_stats_creation() {
+        let stats = AnalyzerStats {
+            concepts_count: 42,
+            relationships_count: 15,
+        };
+
+        assert_eq!(stats.concepts_count, 42);
+        assert_eq!(stats.relationships_count, 15);
     }
 }

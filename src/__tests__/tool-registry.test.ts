@@ -13,21 +13,29 @@ import * as ToolRegistryModule from '../mcp-server/tool-registry.js';
 describe('Tool Registry', () => {
   describe('Module exports', () => {
     it('should export the ToolRegistryModule', () => {
-      expect(ToolRegistryModule).toBeDefined();
+      expect(ToolRegistryModule).toMatchObject({
+        ToolRegistry: expect.any(Function),
+        createToolRegistry: expect.any(Function),
+        ToolCategory: expect.any(Object),
+      });
     });
 
     it('should export ToolRegistry class', () => {
-      expect(ToolRegistryModule.ToolRegistry).toBeDefined();
       expect(typeof ToolRegistryModule.ToolRegistry).toBe('function');
+      expect(ToolRegistryModule.ToolRegistry.prototype).toHaveProperty('register');
+      expect(ToolRegistryModule.ToolRegistry.prototype).toHaveProperty('get');
     });
 
     it('should export createToolRegistry function', () => {
-      expect(ToolRegistryModule.createToolRegistry).toBeDefined();
       expect(typeof ToolRegistryModule.createToolRegistry).toBe('function');
     });
 
     it('should export ToolCategory enum', () => {
-      expect(ToolRegistryModule.ToolCategory).toBeDefined();
+      expect(ToolRegistryModule.ToolCategory).toMatchObject({
+        Analysis: expect.any(String),
+        Search: expect.any(String),
+        Intelligence: expect.any(String),
+      });
     });
   });
 
@@ -153,9 +161,11 @@ describe('Tool Registry', () => {
     it('should get tool by name', () => {
       const tool = registry.get('analyze_codebase');
 
-      expect(tool).toBeDefined();
-      expect(tool?.name).toBe('analyze_codebase');
-      expect(tool?.description).toBe('Analyze code structure');
+      expect(tool).toMatchObject({
+        name: 'analyze_codebase',
+        description: 'Analyze code structure',
+        category: ToolRegistryModule.ToolCategory.Analysis,
+      });
     });
 
     it('should return undefined for unknown tool', () => {
@@ -291,22 +301,22 @@ describe('Tool Registry', () => {
       expect(mcpTools[0]).toMatchObject({
         name: 'analyze_codebase',
         description: 'Analyze code structure and patterns',
-        inputSchema: {
+        inputSchema: expect.objectContaining({
           type: 'object',
-          properties: {
-            path: { type: 'string', description: 'Path to analyze' },
-            includeFileContent: { type: 'boolean' },
-          },
+          properties: expect.objectContaining({
+            path: expect.objectContaining({ type: 'string' }),
+            includeFileContent: expect.objectContaining({ type: 'boolean' }),
+          }),
           required: ['path'],
-        },
+        }),
       });
     });
 
     it('should create handler map for MCP server', () => {
       const handlers = registry.getHandlerMap();
 
-      expect(handlers.get('analyze_codebase')).toBeDefined();
-      expect(typeof handlers.get('analyze_codebase')).toBe('function');
+      expect(handlers).toBeInstanceOf(Map);
+      expect(handlers.get('analyze_codebase')).toEqual(expect.any(Function));
     });
   });
 
@@ -444,24 +454,18 @@ describe('Tool Registry', () => {
   });
 
   describe('ToolCategory enum', () => {
-    it('should have Analysis category', () => {
-      expect(ToolRegistryModule.ToolCategory.Analysis).toBeDefined();
-    });
+    it('should have all required categories with string values', () => {
+      expect(ToolRegistryModule.ToolCategory).toMatchObject({
+        Analysis: expect.any(String),
+        Search: expect.any(String),
+        Intelligence: expect.any(String),
+        Utility: expect.any(String),
+        Monitoring: expect.any(String),
+      });
 
-    it('should have Search category', () => {
-      expect(ToolRegistryModule.ToolCategory.Search).toBeDefined();
-    });
-
-    it('should have Intelligence category', () => {
-      expect(ToolRegistryModule.ToolCategory.Intelligence).toBeDefined();
-    });
-
-    it('should have Utility category', () => {
-      expect(ToolRegistryModule.ToolCategory.Utility).toBeDefined();
-    });
-
-    it('should have Monitoring category', () => {
-      expect(ToolRegistryModule.ToolCategory.Monitoring).toBeDefined();
+      // Verify categories have unique values
+      const values = Object.values(ToolRegistryModule.ToolCategory);
+      expect(new Set(values).size).toBe(values.length);
     });
   });
 });

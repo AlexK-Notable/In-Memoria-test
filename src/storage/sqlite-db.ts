@@ -2,6 +2,8 @@ import Database from 'better-sqlite3';
 import { mkdirSync, existsSync } from 'fs';
 import { dirname, isAbsolute } from 'path';
 import { DatabaseMigrator } from './migrations.js';
+import { StatementCache, type StatementCacheStats } from './statement-cache.js';
+import { QueryCache, type QueryCacheStats } from './query-cache.js';
 import { Logger } from '../utils/logger.js';
 import { escapeLikePattern } from '../utils/security.js';
 import type { IStorageProvider } from '../interfaces/engines.js';
@@ -230,6 +232,8 @@ type QueryParams = (string | number | null | boolean)[];
 export class SQLiteDatabase implements IStorageProvider {
   private db: Database.Database;
   private migrator: DatabaseMigrator;
+  private statementCache: StatementCache;
+  private queryCache: QueryCache<unknown>;
 
   constructor(dbPath: string = ':memory:') {
     // Ensure parent directory exists for file-based databases
@@ -242,6 +246,16 @@ export class SQLiteDatabase implements IStorageProvider {
     }
 
     this.db = new Database(dbPath);
+
+    // Initialize statement cache for prepared statement reuse
+    this.statementCache = new StatementCache(this.db, { maxSize: 100 });
+
+    // Initialize query cache for result caching with LRU eviction and TTL
+    this.queryCache = new QueryCache<unknown>({
+      maxSize: 500,      // Cache up to 500 query results
+      ttlMs: 300000,     // 5 minute TTL
+      refreshOnAccess: false,
+    });
 
     // Enable WAL mode for better crash recovery and concurrent access
     // WAL mode provides better crash safety - incomplete transactions are rolled back on recovery
@@ -288,7 +302,7 @@ export class SQLiteDatabase implements IStorageProvider {
   insertSemanticConceptsBatch(concepts: Omit<SemanticConcept, 'createdAt' | 'updatedAt'>[]): void {
     if (concepts.length === 0) return;
 
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       INSERT OR REPLACE INTO semantic_concepts (
         id, concept_name, concept_type, confidence_score,
         relationships, evolution_history, file_path, line_range
@@ -309,6 +323,9 @@ export class SQLiteDatabase implements IStorageProvider {
         );
       }
     });
+
+    // Invalidate semantic concepts cache
+    this.queryCache.invalidateByPrefix('semantic_concepts:');
   }
 
   /**
@@ -317,7 +334,7 @@ export class SQLiteDatabase implements IStorageProvider {
   insertDeveloperPatternsBatch(patterns: Omit<DeveloperPattern, 'createdAt' | 'lastSeen'>[]): void {
     if (patterns.length === 0) return;
 
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       INSERT OR REPLACE INTO developer_patterns (
         pattern_id, pattern_type, pattern_content, frequency,
         contexts, examples, confidence, last_seen
@@ -337,6 +354,9 @@ export class SQLiteDatabase implements IStorageProvider {
         );
       }
     });
+
+    // Invalidate developer patterns cache
+    this.queryCache.invalidateByPrefix('developer_patterns:');
   }
 
   /**
@@ -345,7 +365,7 @@ export class SQLiteDatabase implements IStorageProvider {
   insertFeatureMapsBatch(features: Omit<FeatureMap, 'createdAt' | 'updatedAt'>[]): void {
     if (features.length === 0) return;
 
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       INSERT OR REPLACE INTO feature_maps (
         id, project_path, feature_name, primary_files,
         related_files, dependencies, status
@@ -369,9 +389,9 @@ export class SQLiteDatabase implements IStorageProvider {
 
   // Semantic Concepts
   insertSemanticConcept(concept: Omit<SemanticConcept, 'createdAt' | 'updatedAt'>): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       INSERT OR REPLACE INTO semantic_concepts (
-        id, concept_name, concept_type, confidence_score, 
+        id, concept_name, concept_type, confidence_score,
         relationships, evolution_history, file_path, line_range
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
@@ -386,9 +406,20 @@ export class SQLiteDatabase implements IStorageProvider {
       concept.filePath,
       JSON.stringify(concept.lineRange)
     );
+
+    // Invalidate affected caches
+    this.queryCache.invalidateByPrefix('semantic_concepts:');
   }
 
   getSemanticConcepts(filePath?: string): SemanticConcept[] {
+    const cacheKey = `semantic_concepts:${filePath ?? 'all'}`;
+
+    // Try cache first
+    const cached = this.queryCache.get(cacheKey);
+    if (cached) {
+      return cached as SemanticConcept[];
+    }
+
     let query = 'SELECT * FROM semantic_concepts';
     let params: QueryParams = [];
 
@@ -397,10 +428,10 @@ export class SQLiteDatabase implements IStorageProvider {
       params = [filePath];
     }
 
-    const stmt = this.db.prepare(query);
+    const stmt = this.statementCache.prepare(query);
     const rows = stmt.all(...params) as SemanticConceptRow[];
 
-    return rows.map(row => ({
+    const result = rows.map(row => ({
       id: row.id,
       conceptName: row.concept_name,
       conceptType: row.concept_type,
@@ -412,11 +443,15 @@ export class SQLiteDatabase implements IStorageProvider {
       createdAt: new Date(row.created_at + ' UTC'),
       updatedAt: new Date(row.updated_at + ' UTC')
     }));
+
+    // Cache the result
+    this.queryCache.set(cacheKey, result);
+    return result;
   }
 
   // Developer Patterns
   insertDeveloperPattern(pattern: Omit<DeveloperPattern, 'createdAt' | 'lastSeen'>): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       INSERT OR REPLACE INTO developer_patterns (
         pattern_id, pattern_type, pattern_content, frequency,
         contexts, examples, confidence, last_seen
@@ -432,9 +467,22 @@ export class SQLiteDatabase implements IStorageProvider {
       JSON.stringify(pattern.examples),
       pattern.confidence
     );
+
+    // Invalidate developer patterns cache
+    this.queryCache.invalidateByPrefix('developer_patterns:');
   }
 
   getDeveloperPatterns(patternType?: string, limit?: number): DeveloperPattern[] {
+    // Normalize limit for cache key (undefined becomes default 50)
+    const effectiveLimit = limit !== undefined && limit > 0 ? limit : 50;
+    const cacheKey = `developer_patterns:${patternType ?? 'all'}:${effectiveLimit}`;
+
+    // Try cache first
+    const cached = this.queryCache.get(cacheKey);
+    if (cached) {
+      return cached as DeveloperPattern[];
+    }
+
     let query = 'SELECT * FROM developer_patterns';
     let params: QueryParams = [];
 
@@ -454,10 +502,10 @@ export class SQLiteDatabase implements IStorageProvider {
       query += ' LIMIT 50';
     }
 
-    const stmt = this.db.prepare(query);
+    const stmt = this.statementCache.prepare(query);
     const rows = stmt.all(...params) as DeveloperPatternRow[];
 
-    return rows.map(row => ({
+    const result = rows.map(row => ({
       patternId: row.pattern_id,
       patternType: row.pattern_type,
       patternContent: JSON.parse(row.pattern_content),
@@ -468,11 +516,15 @@ export class SQLiteDatabase implements IStorageProvider {
       createdAt: new Date(row.created_at + ' UTC'),
       lastSeen: new Date(row.last_seen + ' UTC')
     }));
+
+    // Cache the result
+    this.queryCache.set(cacheKey, result);
+    return result;
   }
 
   // File Intelligence
   insertFileIntelligence(fileIntel: Omit<FileIntelligence, 'createdAt'>): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       INSERT OR REPLACE INTO file_intelligence (
         file_path, file_hash, semantic_concepts, patterns_used,
         complexity_metrics, dependencies, last_analyzed
@@ -487,15 +539,30 @@ export class SQLiteDatabase implements IStorageProvider {
       JSON.stringify(fileIntel.complexityMetrics),
       JSON.stringify(fileIntel.dependencies)
     );
+
+    // Invalidate file intelligence cache for this specific file
+    this.queryCache.invalidateByPrefix(`file_intelligence:${fileIntel.filePath}`);
   }
 
   getFileIntelligence(filePath: string): FileIntelligence | null {
-    const stmt = this.db.prepare('SELECT * FROM file_intelligence WHERE file_path = ?');
+    const cacheKey = `file_intelligence:${filePath}`;
+
+    // Try cache first
+    const cached = this.queryCache.get(cacheKey);
+    if (cached !== undefined) {
+      return cached as FileIntelligence | null;
+    }
+
+    const stmt = this.statementCache.prepare('SELECT * FROM file_intelligence WHERE file_path = ?');
     const row = stmt.get(filePath) as FileIntelligenceRow | undefined;
 
-    if (!row) return null;
+    if (!row) {
+      // Cache the null result to avoid repeated lookups
+      this.queryCache.set(cacheKey, null);
+      return null;
+    }
 
-    return {
+    const result: FileIntelligence = {
       filePath: row.file_path,
       fileHash: row.file_hash,
       semanticConcepts: JSON.parse(row.semantic_concepts || '[]'),
@@ -505,11 +572,15 @@ export class SQLiteDatabase implements IStorageProvider {
       lastAnalyzed: new Date(row.last_analyzed + ' UTC'),
       createdAt: new Date(row.created_at + ' UTC')
     };
+
+    // Cache the result
+    this.queryCache.set(cacheKey, result);
+    return result;
   }
 
   // AI Insights
   insertAIInsight(insight: Omit<AIInsight, 'createdAt'>): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       INSERT INTO ai_insights (
         insight_id, insight_type, insight_content, confidence_score,
         source_agent, validation_status, impact_prediction
@@ -538,7 +609,7 @@ export class SQLiteDatabase implements IStorageProvider {
 
     query += ' ORDER BY confidence_score DESC, created_at DESC';
 
-    const stmt = this.db.prepare(query);
+    const stmt = this.statementCache.prepare(query);
     const rows = stmt.all(...params) as AIInsightRow[];
 
     return rows.map(row => ({
@@ -554,7 +625,7 @@ export class SQLiteDatabase implements IStorageProvider {
   }
 
   insertFeatureMap(feature: Omit<FeatureMap, 'createdAt' | 'updatedAt'>): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       INSERT OR REPLACE INTO feature_map (
         id, project_path, feature_name, primary_files, related_files,
         dependencies, status
@@ -584,7 +655,7 @@ export class SQLiteDatabase implements IStorageProvider {
     // Try to find feature maps with any of the path variants
     let rows: FeatureMapRow[] = [];
     for (const path of paths) {
-      const stmt = this.db.prepare(`
+      const stmt = this.statementCache.prepare(`
         SELECT * FROM feature_map WHERE project_path = ? AND status = 'active'
         ORDER BY feature_name
       `);
@@ -608,7 +679,7 @@ export class SQLiteDatabase implements IStorageProvider {
   searchFeatureMaps(projectPath: string, query: string): FeatureMap[] {
     // Escape LIKE special characters to prevent wildcard injection
     const escapedQuery = escapeLikePattern(query);
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       SELECT * FROM feature_map
       WHERE project_path = ? AND status = 'active'
         AND (feature_name LIKE ? ESCAPE '\\' OR feature_name LIKE ? ESCAPE '\\' OR feature_name LIKE ? ESCAPE '\\')
@@ -631,7 +702,7 @@ export class SQLiteDatabase implements IStorageProvider {
   }
 
   getFeatureByName(projectPath: string, featureName: string): FeatureMap | null {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       SELECT * FROM feature_map
       WHERE project_path = ? AND feature_name = ? AND status = 'active'
       LIMIT 1
@@ -654,7 +725,7 @@ export class SQLiteDatabase implements IStorageProvider {
   }
 
   insertEntryPoint(entryPoint: Omit<EntryPoint, 'createdAt'>): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       INSERT OR REPLACE INTO entry_points (
         id, project_path, entry_type, file_path, description, framework
       ) VALUES (?, ?, ?, ?, ?, ?)
@@ -682,7 +753,7 @@ export class SQLiteDatabase implements IStorageProvider {
     // Try to find entry points with any of the path variants
     let rows: EntryPointRow[] = [];
     for (const path of paths) {
-      const stmt = this.db.prepare(`
+      const stmt = this.statementCache.prepare(`
         SELECT * FROM entry_points WHERE project_path = ?
         ORDER BY entry_type, file_path
       `);
@@ -702,7 +773,7 @@ export class SQLiteDatabase implements IStorageProvider {
   }
 
   insertKeyDirectory(directory: Omit<KeyDirectory, 'createdAt'>): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       INSERT OR REPLACE INTO key_directories (
         id, project_path, directory_path, directory_type, file_count, description
       ) VALUES (?, ?, ?, ?, ?, ?)
@@ -730,7 +801,7 @@ export class SQLiteDatabase implements IStorageProvider {
     // Try to find key directories with any of the path variants
     let rows: KeyDirectoryRow[] = [];
     for (const path of paths) {
-      const stmt = this.db.prepare(`
+      const stmt = this.statementCache.prepare(`
         SELECT * FROM key_directories WHERE project_path = ?
         ORDER BY directory_type, directory_path
       `);
@@ -759,7 +830,7 @@ export class SQLiteDatabase implements IStorageProvider {
     intelligenceVersion?: string;
     lastFullScan?: Date;
   }): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       INSERT OR REPLACE INTO project_metadata (
         project_id, project_path, project_name, language_primary,
         languages_detected, framework_detected, intelligence_version, last_full_scan
@@ -790,7 +861,7 @@ export class SQLiteDatabase implements IStorageProvider {
     createdAt: Date;
     updatedAt: Date;
   } | null {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       SELECT * FROM project_metadata WHERE project_path = ? LIMIT 1
     `);
     const row = stmt.get(projectPath) as ProjectMetadataRow | undefined;
@@ -812,7 +883,7 @@ export class SQLiteDatabase implements IStorageProvider {
   }
 
   createWorkSession(session: Omit<WorkSession, 'sessionStart' | 'lastUpdated'>): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       INSERT INTO work_sessions (
         id, project_path, session_end, last_feature, current_files,
         completed_tasks, pending_tasks, blockers, session_notes
@@ -870,7 +941,7 @@ export class SQLiteDatabase implements IStorageProvider {
     fields.push('last_updated = CURRENT_TIMESTAMP');
     values.push(sessionId);
 
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       UPDATE work_sessions SET ${fields.join(', ')} WHERE id = ?
     `);
 
@@ -878,7 +949,7 @@ export class SQLiteDatabase implements IStorageProvider {
   }
 
   getCurrentWorkSession(projectPath: string): WorkSession | null {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       SELECT * FROM work_sessions
       WHERE project_path = ? AND session_end IS NULL
       ORDER BY session_start DESC
@@ -904,7 +975,7 @@ export class SQLiteDatabase implements IStorageProvider {
   }
 
   getWorkSessions(projectPath: string, limit = 10): WorkSession[] {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       SELECT * FROM work_sessions
       WHERE project_path = ?
       ORDER BY session_start DESC
@@ -928,7 +999,7 @@ export class SQLiteDatabase implements IStorageProvider {
   }
 
   upsertProjectDecision(decision: Omit<ProjectDecision, 'madeAt'>): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       INSERT OR REPLACE INTO project_decisions (
         id, project_path, decision_key, decision_value, reasoning
       ) VALUES (?, ?, ?, ?, ?)
@@ -944,7 +1015,7 @@ export class SQLiteDatabase implements IStorageProvider {
   }
 
   getProjectDecisions(projectPath: string, limit = 20): ProjectDecision[] {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       SELECT * FROM project_decisions
       WHERE project_path = ?
       ORDER BY made_at DESC
@@ -963,7 +1034,7 @@ export class SQLiteDatabase implements IStorageProvider {
   }
 
   getProjectDecision(projectPath: string, decisionKey: string): ProjectDecision | null {
-    const stmt = this.db.prepare(`
+    const stmt = this.statementCache.prepare(`
       SELECT * FROM project_decisions
       WHERE project_path = ? AND decision_key = ?
     `);
@@ -989,7 +1060,39 @@ export class SQLiteDatabase implements IStorageProvider {
     return this.db;
   }
 
+  /**
+   * Get statement cache statistics for monitoring and debugging.
+   * Useful for understanding cache effectiveness and tuning maxSize.
+   *
+   * @returns Cache statistics including hits, misses, size, and hit rate
+   */
+  getStatementCacheStats(): StatementCacheStats {
+    return this.statementCache.getStats();
+  }
+
+  /**
+   * Get query cache statistics for monitoring and debugging.
+   * Useful for understanding result cache effectiveness.
+   *
+   * @returns Cache statistics including hits, misses, size, hit rate, expirations, and evictions
+   */
+  getQueryCacheStats(): QueryCacheStats {
+    return this.queryCache.getStats();
+  }
+
+  /**
+   * Clear the query result cache.
+   * Useful when data has changed externally or for testing.
+   */
+  clearQueryCache(): void {
+    this.queryCache.clear();
+  }
+
   close(): void {
+    // Clear caches before closing
+    this.statementCache.clear();
+    this.queryCache.clear();
+
     // Checkpoint WAL before closing to ensure all data is persisted to main database
     // TRUNCATE mode resets WAL file to zero bytes after checkpoint
     try {

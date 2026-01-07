@@ -4,6 +4,7 @@ import { SQLiteDatabase } from '../storage/sqlite-db.js';
 import { SemanticVectorDB } from '../storage/vector-db.js';
 import { config } from '../config/config.js';
 import { nanoid } from 'nanoid';
+import { Logger } from '../utils/logger.js';
 import {
   LearningPipeline,
   createLearningPipeline,
@@ -11,6 +12,12 @@ import {
   type PipelineContext,
   type ProgressUpdate,
 } from './learning-pipeline.js';
+import type {
+  ISemanticEngine,
+  IPatternEngine,
+  IStorageProvider,
+  IVectorDatabase,
+} from '../interfaces/engines.js';
 
 // Local types for learning operations
 interface LearnedConcept {
@@ -32,6 +39,115 @@ interface LearnedPattern {
   confidence: number;
   contexts: string[];
   examples: Array<{ code: string }>;
+}
+
+// ============================================================================
+// Dependency Injection Types
+// ============================================================================
+
+/**
+ * Dependencies required by LearningService.
+ * This interface enables dependency injection for testing and loose coupling.
+ */
+export interface LearningDependencies {
+  /** Storage provider for persisting learned data */
+  database: IStorageProvider;
+  /** Vector database for semantic embeddings */
+  vectorDB: IVectorDatabase;
+  /** Semantic analysis engine */
+  semanticEngine: ISemanticEngine;
+  /** Pattern detection engine */
+  patternEngine: IPatternEngine;
+}
+
+/**
+ * Extended database interface that includes additional methods
+ * used by LearningService but not part of IStorageProvider
+ */
+export interface ExtendedDatabase extends IStorageProvider {
+  getProjectMetadata(projectPath: string): unknown | null;
+  insertProjectMetadata(metadata: {
+    projectId: string;
+    projectPath: string;
+    projectName: string;
+    languagePrimary?: string;
+    languagesDetected: string[];
+    frameworkDetected: string[];
+    intelligenceVersion: string;
+    lastFullScan: Date;
+  }): void;
+  insertEntryPoint(entryPoint: {
+    id: string;
+    projectPath: string;
+    entryType: string;
+    filePath: string;
+    description?: string;
+    framework?: string;
+  }): void;
+  insertKeyDirectory(directory: {
+    id: string;
+    projectPath: string;
+    directoryPath: string;
+    directoryType: string;
+    fileCount: number;
+    description?: string;
+  }): void;
+  close(): void;
+}
+
+/**
+ * Factory interface for creating LearningService dependencies.
+ * Implementations can provide different dependency creation strategies.
+ */
+export interface LearningServiceFactory {
+  createForProject(projectPath: string): LearningDependencies;
+}
+
+/**
+ * Default factory that creates real dependencies for production use.
+ */
+export class DefaultLearningServiceFactory implements LearningServiceFactory {
+  constructor(private apiKey?: string) {}
+
+  createForProject(projectPath: string): LearningDependencies {
+    const dbPath = config.getDatabasePath(projectPath);
+    const database = new SQLiteDatabase(dbPath);
+    const vectorDB = new SemanticVectorDB(this.apiKey);
+    const semanticEngine = new SemanticEngine(database, vectorDB);
+    const patternEngine = new PatternEngine(database);
+
+    return { database, vectorDB, semanticEngine, patternEngine };
+  }
+}
+
+// Singleton default factory
+let defaultFactory: LearningServiceFactory | null = null;
+
+/**
+ * Get the default factory for creating dependencies.
+ * Uses lazy initialization with the OPENAI_API_KEY from environment.
+ */
+export function getDefaultFactory(): LearningServiceFactory {
+  if (!defaultFactory) {
+    defaultFactory = new DefaultLearningServiceFactory(process.env.OPENAI_API_KEY);
+  }
+  return defaultFactory;
+}
+
+/**
+ * Set a custom factory for creating dependencies.
+ * Useful for testing or custom configurations.
+ */
+export function setDefaultFactory(factory: LearningServiceFactory): void {
+  defaultFactory = factory;
+}
+
+/**
+ * Reset the default factory to null.
+ * Useful for testing to ensure fresh factory on each test.
+ */
+export function resetDefaultFactory(): void {
+  defaultFactory = null;
 }
 
 interface CodebaseAnalysisResult {
@@ -79,33 +195,58 @@ export interface LearningOptions {
 }
 
 /**
- * Shared learning service used by both CLI and MCP tools
- * Ensures consistent behavior across all interfaces
+ * Shared learning service used by both CLI and MCP tools.
+ * Ensures consistent behavior across all interfaces.
+ *
+ * Supports two usage patterns:
+ * 1. Instance-based with DI: `new LearningService(deps).learn(path, options)`
+ * 2. Static convenience method: `LearningService.learnFromCodebase(path, options)`
  */
 export class LearningService {
+  private deps: LearningDependencies;
+  private projectPath: string;
+
   /**
-   * Learn from a codebase - shared implementation for CLI and MCP
+   * Create a LearningService instance with injected dependencies.
+   * This is the preferred pattern for testing and custom configurations.
+   *
+   * @param deps - The dependencies to use for learning operations
+   * @param projectPath - The project path for this service instance
    */
-  static async learnFromCodebase(
-    path: string,
-    options: LearningOptions = {}
-  ): Promise<LearningResult> {
+  constructor(deps: LearningDependencies, projectPath: string) {
+    this.deps = deps;
+    this.projectPath = projectPath;
+  }
+
+  /**
+   * Get the injected dependencies (useful for testing verification)
+   */
+  getDependencies(): LearningDependencies {
+    return this.deps;
+  }
+
+  /**
+   * Instance method: Learn from the codebase using injected dependencies.
+   * This method uses the dependencies provided in the constructor.
+   */
+  async learn(options: LearningOptions = {}): Promise<LearningResult> {
     const startTime = Date.now();
     const insights: string[] = [];
+    const { database, vectorDB, semanticEngine, patternEngine } = this.deps;
 
-    // Create project-specific database and engines
-    const projectDbPath = config.getDatabasePath(path);
-    const projectDatabase = new SQLiteDatabase(projectDbPath);
-    const projectVectorDB = new SemanticVectorDB(process.env.OPENAI_API_KEY);
-    const projectSemanticEngine = new SemanticEngine(projectDatabase, projectVectorDB);
-    const projectPatternEngine = new PatternEngine(projectDatabase);
+    // Cast to ExtendedDatabase for additional methods
+    const extendedDatabase = database as ExtendedDatabase;
 
     try {
-      console.error(`🗄️ Using project database: ${projectDbPath}`);
+      const projectDbPath = config.getDatabasePath(this.projectPath);
+      Logger.info('Using project database', { projectDbPath });
 
       // Check if already learned and not forcing re-learn
       if (!options.force) {
-        const existingIntelligence = await this.checkExistingIntelligence(projectDatabase, path);
+        const existingIntelligence = await LearningService.checkExistingIntelligenceFromProvider(
+          database,
+          this.projectPath
+        );
         if (existingIntelligence && existingIntelligence.concepts > 0) {
           return {
             success: true,
@@ -119,17 +260,17 @@ export class LearningService {
       }
 
       // Phase 1: Comprehensive codebase analysis
-      insights.push('🔍 Phase 1: Analyzing codebase structure...');
-      const codebaseAnalysis = await projectSemanticEngine.analyzeCodebase(path);
-      insights.push(`   ✅ Detected languages: ${codebaseAnalysis.languages?.join(', ') || 'unknown'}`);
-      insights.push(`   ✅ Found frameworks: ${codebaseAnalysis.frameworks?.join(', ') || 'none detected'}`);
+      insights.push('Phase 1: Analyzing codebase structure...');
+      const codebaseAnalysis = await semanticEngine.analyzeCodebase(this.projectPath);
+      insights.push(`   Detected languages: ${codebaseAnalysis.languages?.join(', ') || 'unknown'}`);
+      insights.push(`   Found frameworks: ${codebaseAnalysis.frameworks?.join(', ') || 'none detected'}`);
       if (codebaseAnalysis.complexity) {
-        insights.push(`   ✅ Complexity: ${codebaseAnalysis.complexity.cyclomatic?.toFixed(1) || 'N/A'} cyclomatic, ${codebaseAnalysis.complexity.cognitive?.toFixed(1) || 'N/A'} cognitive`);
+        insights.push(`   Complexity: ${codebaseAnalysis.complexity.cyclomatic?.toFixed(1) || 'N/A'} cyclomatic, ${codebaseAnalysis.complexity.cognitive?.toFixed(1) || 'N/A'} cognitive`);
       }
 
       // Phase 2: Deep semantic learning
-      insights.push('🧠 Phase 2: Learning semantic concepts...');
-      const concepts = await projectSemanticEngine.learnFromCodebase(path, options.progressCallback);
+      insights.push('Phase 2: Learning semantic concepts...');
+      const concepts = await semanticEngine.learnFromCodebase(this.projectPath, options.progressCallback);
 
       // Analyze concept distribution
       const conceptTypes = concepts.reduce((acc, concept) => {
@@ -138,14 +279,14 @@ export class LearningService {
         return acc;
       }, {} as Record<string, number>);
 
-      insights.push(`   ✅ Extracted ${concepts.length} semantic concepts:`);
+      insights.push(`   Extracted ${concepts.length} semantic concepts:`);
       Object.entries(conceptTypes).forEach(([type, count]) => {
         insights.push(`     - ${count} ${type}${count > 1 ? 's' : ''}`);
       });
 
       // Phase 3: Pattern discovery and learning
-      insights.push('🔄 Phase 3: Discovering coding patterns...');
-      const patterns = await projectPatternEngine.learnFromCodebase(path, options.progressCallback);
+      insights.push('Phase 3: Discovering coding patterns...');
+      const patterns = await patternEngine.learnFromCodebase(this.projectPath, options.progressCallback);
 
       // Analyze pattern distribution
       const patternTypes = patterns.reduce((acc, pattern) => {
@@ -155,61 +296,77 @@ export class LearningService {
         return acc;
       }, {} as Record<string, number>);
 
-      insights.push(`   ✅ Identified ${patterns.length} coding patterns:`);
+      insights.push(`   Identified ${patterns.length} coding patterns:`);
       Object.entries(patternTypes).forEach(([category, count]) => {
         insights.push(`     - ${count} ${category} pattern${count > 1 ? 's' : ''}`);
       });
 
       // Phase 4: Relationship and dependency analysis
-      insights.push('🔗 Phase 4: Analyzing relationships and dependencies...');
-      const relationships = await this.analyzeCodebaseRelationships(concepts, patterns);
-      insights.push(`   ✅ Built ${relationships.conceptRelationships} concept relationships`);
-      insights.push(`   ✅ Identified ${relationships.dependencyPatterns} dependency patterns`);
+      insights.push('Phase 4: Analyzing relationships and dependencies...');
+      const relationships = await LearningService.analyzeCodebaseRelationships(
+        concepts as LearnedConcept[],
+        patterns as LearnedPattern[]
+      );
+      insights.push(`   Built ${relationships.conceptRelationships} concept relationships`);
+      insights.push(`   Identified ${relationships.dependencyPatterns} dependency patterns`);
 
       // Phase 5: Intelligence synthesis and storage
-      insights.push('💾 Phase 5: Synthesizing and storing intelligence...');
-      await this.storeIntelligence(projectDatabase, path, concepts, patterns);
+      insights.push('Phase 5: Synthesizing and storing intelligence...');
+      await LearningService.storeIntelligenceFromProvider(
+        database,
+        this.projectPath,
+        concepts as LearnedConcept[],
+        patterns as LearnedPattern[]
+      );
 
       // Generate learning insights
-      const learningInsights = await this.generateLearningInsights(concepts, patterns, codebaseAnalysis);
-      insights.push('🎯 Learning Summary:');
+      const learningInsights = await LearningService.generateLearningInsights(
+        concepts as LearnedConcept[],
+        patterns as LearnedPattern[],
+        codebaseAnalysis as CodebaseAnalysisResult
+      );
+      insights.push('Learning Summary:');
       learningInsights.forEach(insight => insights.push(`   ${insight}`));
 
       // Phase 6: Vector embeddings for semantic search
-      insights.push('🔍 Phase 6: Building semantic search index...');
-      insights.push(`   ✅ Using free local embeddings (transformers.js)`);
+      insights.push('Phase 6: Building semantic search index...');
+      insights.push(`   Using free local embeddings (transformers.js)`);
 
-      const vectorCount = await this.buildSemanticIndex(projectVectorDB, concepts, patterns);
-      insights.push(`   ✅ Created ${vectorCount} vector embeddings for semantic search`);
+      const vectorCount = await LearningService.buildSemanticIndexFromProvider(
+        vectorDB,
+        concepts as LearnedConcept[],
+        patterns as LearnedPattern[]
+      );
+      insights.push(`   Created ${vectorCount} vector embeddings for semantic search`);
 
       // Phase 6.5: Ensure project metadata exists (required for foreign keys)
-      insights.push('📋 Phase 6.5: Ensuring project metadata...');
-      const existingMetadata = projectDatabase.getProjectMetadata(path);
+      insights.push('Phase 6.5: Ensuring project metadata...');
+      const existingMetadata = extendedDatabase.getProjectMetadata(this.projectPath);
       if (!existingMetadata) {
-        projectDatabase.insertProjectMetadata({
+        extendedDatabase.insertProjectMetadata({
           projectId: nanoid(),
-          projectPath: path,
-          projectName: path.split('/').pop() || 'unknown',
+          projectPath: this.projectPath,
+          projectName: this.projectPath.split('/').pop() || 'unknown',
           languagePrimary: codebaseAnalysis.languages?.[0],
           languagesDetected: codebaseAnalysis.languages || [],
           frameworkDetected: codebaseAnalysis.frameworks || [],
           intelligenceVersion: '0.6.0',
           lastFullScan: new Date()
         });
-        insights.push(`   ✅ Created project metadata for ${path}`);
+        insights.push(`   Created project metadata for ${this.projectPath}`);
       } else {
-        insights.push(`   ✅ Project metadata already exists`);
+        insights.push(`   Project metadata already exists`);
       }
 
       // Phase 7: Feature mapping for intelligent file routing
-      insights.push('🗺️  Phase 7: Building feature map for file routing...');
-      const featureMaps = await projectPatternEngine.buildFeatureMap(path);
+      insights.push('Phase 7: Building feature map for file routing...');
+      const featureMaps = await patternEngine.buildFeatureMap(this.projectPath);
 
       // Debug: Log what we got from buildFeatureMap
       if (featureMaps.length > 0) {
-        insights.push(`   🔍 Debug: Received ${featureMaps.length} feature maps from buildFeatureMap`);
+        insights.push(`   Debug: Received ${featureMaps.length} feature maps from buildFeatureMap`);
         const sample = featureMaps[0];
-        insights.push(`   🔍 Debug: Sample feature map: id=${sample?.id}, featureName=${sample?.featureName}, primaryFiles=${sample?.primaryFiles?.length || 0}`);
+        insights.push(`   Debug: Sample feature map: id=${sample?.id}, featureName=${sample?.featureName}, primaryFiles=${sample?.primaryFiles?.length || 0}`);
       }
 
       // Store feature maps in database (filter out invalid ones)
@@ -227,9 +384,9 @@ export class LearningService {
           continue;
         }
 
-        projectDatabase.insertFeatureMap({
+        database.insertFeatureMap({
           id: featureMap.id,
-          projectPath: path,
+          projectPath: this.projectPath,
           featureName: featureMap.featureName,
           primaryFiles: featureMap.primaryFiles || [],
           relatedFiles: featureMap.relatedFiles || [],
@@ -241,16 +398,20 @@ export class LearningService {
       const totalFiles = featureMaps.reduce((sum, fm) => sum + (fm.primaryFiles?.length || 0) + (fm.relatedFiles?.length || 0), 0);
       const totalSkipped = skippedDueToMissingId + skippedDueToMissingName;
       if (totalSkipped > 0) {
-        insights.push(`   ⚠️  Skipped ${totalSkipped} invalid feature maps (${skippedDueToMissingId} missing ID, ${skippedDueToMissingName} missing name)`);
+        insights.push(`   Skipped ${totalSkipped} invalid feature maps (${skippedDueToMissingId} missing ID, ${skippedDueToMissingName} missing name)`);
       }
-      insights.push(`   ✅ Mapped ${validFeatureMaps} features to ${totalFiles} files`);
+      insights.push(`   Mapped ${validFeatureMaps} features to ${totalFiles} files`);
 
       // Phase 8: Store blueprint data
-      insights.push('💾 Phase 8: Storing project blueprint...');
-      await this.storeProjectBlueprint(path, codebaseAnalysis, projectDatabase);
+      insights.push('Phase 8: Storing project blueprint...');
+      await LearningService.storeProjectBlueprintFromProvider(
+        this.projectPath,
+        codebaseAnalysis as CodebaseAnalysisResult,
+        extendedDatabase
+      );
 
       const timeElapsed = Date.now() - startTime;
-      insights.push(`⚡ Learning completed in ${timeElapsed}ms`);
+      insights.push(`Learning completed in ${timeElapsed}ms`);
 
       // Build blueprint summary
       const blueprint = {
@@ -263,7 +424,7 @@ export class LearningService {
           acc[dir.type] = dir.path;
           return acc;
         }, {} as Record<string, string>),
-        architecture: this.inferArchitecturePattern(codebaseAnalysis)
+        architecture: LearningService.inferArchitecturePattern(codebaseAnalysis as CodebaseAnalysisResult)
       };
 
       return {
@@ -281,26 +442,216 @@ export class LearningService {
         conceptsLearned: 0,
         patternsLearned: 0,
         featuresLearned: 0,
-        insights: [`❌ Learning failed: ${error instanceof Error ? error.message : error}`],
+        insights: [`Learning failed: ${error instanceof Error ? error.message : error}`],
         timeElapsed: Date.now() - startTime
       };
     } finally {
       // Clean up project-specific resources
-      if (projectSemanticEngine) {
-        projectSemanticEngine.cleanup();
+      if (semanticEngine && 'cleanup' in semanticEngine) {
+        (semanticEngine as { cleanup: () => void }).cleanup();
       }
-      if (projectVectorDB) {
+      if (vectorDB) {
         try {
-          await projectVectorDB.close();
+          await vectorDB.close();
         } catch (error) {
-          console.warn('Warning: Failed to close project vector database:', error);
+          Logger.warn('Failed to close project vector database', { error: error instanceof Error ? error.message : String(error) });
         }
       }
-      if (projectDatabase) {
-        projectDatabase.close();
+      if (extendedDatabase && 'close' in extendedDatabase) {
+        extendedDatabase.close();
       }
     }
   }
+
+  // ============================================================================
+  // Static Convenience Methods (Backward Compatibility)
+  // ============================================================================
+
+  /**
+   * Static convenience method: Learn from a codebase.
+   * This method creates dependencies internally using the default factory.
+   * Maintained for backward compatibility with existing callers.
+   *
+   * For testing or custom configurations, use the instance-based approach:
+   * `new LearningService(deps, path).learn(options)`
+   *
+   * @param path - Path to the codebase
+   * @param options - Learning options
+   * @param factory - Optional custom factory for creating dependencies
+   */
+  static async learnFromCodebase(
+    path: string,
+    options: LearningOptions = {},
+    factory?: LearningServiceFactory
+  ): Promise<LearningResult> {
+    const effectiveFactory = factory ?? getDefaultFactory();
+    const deps = effectiveFactory.createForProject(path);
+    const service = new LearningService(deps, path);
+    return service.learn(options);
+  }
+
+  // ============================================================================
+  // Static Helper Methods (Shared Logic)
+  // ============================================================================
+
+  /**
+   * Check existing intelligence using IStorageProvider interface
+   */
+  private static async checkExistingIntelligenceFromProvider(
+    database: IStorageProvider,
+    path: string
+  ): Promise<{ concepts: number; patterns: number; features: number } | null> {
+    const concepts = database.getSemanticConcepts().length;
+    const patterns = database.getDeveloperPatterns().length;
+    const features = database.getFeatureMaps(path).length;
+
+    if (concepts > 0 || patterns > 0) {
+      return { concepts, patterns, features };
+    }
+
+    Logger.warn('No existing intelligence found in project database - starting fresh analysis', { path });
+    return null;
+  }
+
+  /**
+   * Store intelligence using IStorageProvider interface
+   */
+  private static async storeIntelligenceFromProvider(
+    database: IStorageProvider,
+    _path: string,
+    concepts: LearnedConcept[],
+    patterns: LearnedPattern[]
+  ): Promise<void> {
+    // Store concepts
+    for (const concept of concepts) {
+      database.insertSemanticConcept({
+        id: concept.id,
+        conceptName: concept.name,
+        conceptType: concept.type,
+        confidenceScore: concept.confidence,
+        relationships: concept.relationships,
+        evolutionHistory: {},
+        filePath: concept.filePath || concept.file_path || 'unknown',
+        lineRange: concept.lineRange
+      });
+    }
+
+    // Store patterns
+    for (const pattern of patterns) {
+      database.insertDeveloperPattern({
+        patternId: pattern.id,
+        patternType: pattern.type,
+        patternContent: pattern.content,
+        frequency: pattern.frequency,
+        contexts: pattern.contexts,
+        examples: pattern.examples,
+        confidence: pattern.confidence
+      });
+    }
+  }
+
+  /**
+   * Build semantic index using IVectorDatabase interface
+   */
+  private static async buildSemanticIndexFromProvider(
+    vectorDB: IVectorDatabase,
+    concepts: LearnedConcept[],
+    patterns: LearnedPattern[]
+  ): Promise<number> {
+    try {
+      await vectorDB.initialize('in-memoria-intelligence');
+
+      let vectorCount = 0;
+
+      // Create embeddings for semantic concepts
+      for (const concept of concepts) {
+        const conceptType = concept.type || 'unknown';
+        const text = `${concept.name} ${conceptType}`;
+        await vectorDB.storeCodeEmbedding(text, {
+          id: concept.id,
+          filePath: concept.filePath || concept.file_path || 'unknown',
+          functionName: conceptType === 'function' ? concept.name : undefined,
+          className: conceptType === 'class' ? concept.name : undefined,
+          language: 'unknown',
+          complexity: 1,
+          lineCount: 1,
+          lastModified: new Date()
+        });
+        vectorCount++;
+      }
+
+      // Create embeddings for patterns
+      for (const pattern of patterns) {
+        const patternType = pattern.type || 'unknown';
+        const text = `${patternType} ${pattern.content?.description || ''}`;
+        await vectorDB.storeCodeEmbedding(text, {
+          id: pattern.id,
+          filePath: `pattern-${patternType}`,
+          language: 'pattern',
+          complexity: pattern.frequency || 1,
+          lineCount: 1,
+          lastModified: new Date()
+        });
+        vectorCount++;
+      }
+
+      return vectorCount;
+    } catch (error) {
+      Logger.warn('Failed to build semantic index', { error: error instanceof Error ? error.message : String(error) });
+      return 0;
+    }
+  }
+
+  /**
+   * Store project blueprint using ExtendedDatabase interface
+   */
+  private static async storeProjectBlueprintFromProvider(
+    projectPath: string,
+    codebaseAnalysis: CodebaseAnalysisResult,
+    database: ExtendedDatabase
+  ): Promise<void> {
+    // Store entry points (filter out invalid ones)
+    if (codebaseAnalysis.entryPoints && Array.isArray(codebaseAnalysis.entryPoints)) {
+      for (const entryPoint of codebaseAnalysis.entryPoints) {
+        // Skip entry points with missing required fields
+        if (!entryPoint.type || !entryPoint.filePath) {
+          continue;
+        }
+
+        database.insertEntryPoint({
+          id: nanoid(),
+          projectPath,
+          entryType: entryPoint.type,
+          filePath: entryPoint.filePath,
+          description: entryPoint.description,
+          framework: entryPoint.framework
+        });
+      }
+    }
+
+    // Store key directories (filter out invalid ones)
+    if (codebaseAnalysis.keyDirectories && Array.isArray(codebaseAnalysis.keyDirectories)) {
+      for (const directory of codebaseAnalysis.keyDirectories) {
+        // Skip directories with missing required fields
+        if (!directory.path || !directory.type) {
+          continue;
+        }
+
+        database.insertKeyDirectory({
+          id: nanoid(),
+          projectPath,
+          directoryPath: directory.path,
+          directoryType: directory.type,
+          fileCount: directory.fileCount || 0,
+          description: directory.description
+        });
+      }
+    }
+  }
+
+  // ============================================================================
+  // Legacy Static Methods (For backward compatibility with checkExistingIntelligence)
+  // ============================================================================
 
   private static async checkExistingIntelligence(
     database: SQLiteDatabase,
@@ -314,7 +665,7 @@ export class LearningService {
       return { concepts, patterns, features };
     }
 
-    console.warn('⚠️  No existing intelligence found in project database - starting fresh analysis');
+    Logger.warn('No existing intelligence found in project database - starting fresh analysis', { path });
     return null;
   }
 
@@ -497,78 +848,9 @@ export class LearningService {
 
       return vectorCount;
     } catch (error) {
-      console.warn('Failed to build semantic index:', error);
+      Logger.warn('Failed to build semantic index', { error: error instanceof Error ? error.message : String(error) });
       return 0;
     }
-  }
-
-  private static async storeProjectBlueprint(
-    projectPath: string,
-    codebaseAnalysis: CodebaseAnalysisResult,
-    database: SQLiteDatabase
-  ): Promise<void> {
-    // Debug logging to track what's being received
-    // console.error(`\n🔍 storeProjectBlueprint called for project: ${projectPath}`);
-    // console.error(`   codebaseAnalysis.entryPoints: ${codebaseAnalysis.entryPoints ? `Array(${codebaseAnalysis.entryPoints.length})` : 'undefined'}`);
-    // console.error(`   codebaseAnalysis.keyDirectories: ${codebaseAnalysis.keyDirectories ? `Array(${codebaseAnalysis.keyDirectories.length})` : 'undefined'}`);
-
-    // Store entry points (filter out invalid ones)
-    if (codebaseAnalysis.entryPoints && Array.isArray(codebaseAnalysis.entryPoints)) {
-      // let stored = 0;
-      // let skipped = 0;
-
-      for (const entryPoint of codebaseAnalysis.entryPoints) {
-        // Skip entry points with missing required fields
-        if (!entryPoint.type || !entryPoint.filePath) {
-          // skipped++;
-          // console.error(`   ⚠️  Skipping invalid entry point: type=${entryPoint.type}, filePath=${entryPoint.filePath}`);
-          continue;
-        }
-
-        database.insertEntryPoint({
-          id: nanoid(),
-          projectPath,
-          entryType: entryPoint.type,
-          filePath: entryPoint.filePath,
-          description: entryPoint.description,
-          framework: entryPoint.framework
-        });
-        // stored++;
-      }
-
-      // console.error(`   ✅ Stored ${stored} entry points (${skipped} skipped)`);
-    } // else {
-    // console.error(`   ⚠️  No entry points to store (not an array or undefined)`);
-    // }
-
-    // Store key directories (filter out invalid ones)
-    if (codebaseAnalysis.keyDirectories && Array.isArray(codebaseAnalysis.keyDirectories)) {
-      // let stored = 0;
-      // let skipped = 0;
-
-      for (const directory of codebaseAnalysis.keyDirectories) {
-        // Skip directories with missing required fields
-        if (!directory.path || !directory.type) {
-          // skipped++;
-          // console.error(`   ⚠️  Skipping invalid directory: path=${directory.path}, type=${directory.type}`);
-          continue;
-        }
-
-        database.insertKeyDirectory({
-          id: nanoid(),
-          projectPath,
-          directoryPath: directory.path,
-          directoryType: directory.type,
-          fileCount: directory.fileCount || 0,
-          description: directory.description
-        });
-        // stored++;
-      }
-
-      // console.error(`   ✅ Stored ${stored} key directories (${skipped} skipped)\n`);
-    } // else {
-    // console.error(`   ⚠️  No key directories to store (not an array or undefined)\n`);
-    // }
   }
 
   private static inferArchitecturePattern(codebaseAnalysis: CodebaseAnalysisResult): string {

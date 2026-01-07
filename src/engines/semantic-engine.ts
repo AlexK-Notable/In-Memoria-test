@@ -5,6 +5,8 @@ import { nanoid } from 'nanoid';
 import { CircuitBreaker, createRustAnalyzerCircuitBreaker } from '../utils/circuit-breaker.js';
 import { globalProfiler } from '../utils/performance-profiler.js';
 import { detectLanguageFromPath as resolveLanguageFromPath } from '../utils/language-registry.js';
+import { Logger } from '../utils/logger.js';
+import { withRetry, RetryPresets } from '../utils/retry.js';
 import type { ISemanticEngine } from '../interfaces/engines.js';
 
 // Local types for Rust binding results
@@ -81,6 +83,26 @@ export interface FileAnalysisResult {
   }>;
 }
 
+/**
+ * Semantic analysis engine wrapping Rust FFI for AST parsing and concept extraction.
+ *
+ * ## Thread Safety
+ *
+ * This class provides a thread-safe wrapper around the Rust SemanticAnalyzer.
+ * The underlying Rust instance is protected by NAPI's event loop serialization,
+ * meaning all JavaScript calls are processed sequentially.
+ *
+ * **Safe operations:**
+ * - Creating multiple SemanticEngine instances (each has independent Rust state)
+ * - Calling any method sequentially on the same instance
+ * - Concurrent calls to different instances
+ *
+ * **Unsafe patterns:**
+ * - Sharing the underlying rustAnalyzer across Worker threads
+ * - Calling methods without awaiting (loses ordering guarantees)
+ *
+ * @see docs/FFI_THREAD_SAFETY.md for detailed thread safety documentation
+ */
 export class SemanticEngine implements ISemanticEngine {
   private rustAnalyzer: InstanceType<typeof SemanticAnalyzer> | null = null;
   private rustCircuitBreaker: CircuitBreaker;
@@ -94,6 +116,17 @@ export class SemanticEngine implements ISemanticEngine {
   // Cache TTL in milliseconds (5 minutes)
   private readonly CACHE_TTL = 5 * 60 * 1000;
 
+  /**
+   * Creates a new SemanticEngine instance.
+   *
+   * Each instance maintains its own Rust SemanticAnalyzer, caches, and circuit breaker.
+   * Instances are completely independent and can be used concurrently.
+   *
+   * @param database - SQLite database for persisting semantic concepts
+   * @param vectorDB - Vector database for semantic similarity search
+   *
+   * @thread-safe Instance creation is always safe
+   */
   constructor(
     private database: SQLiteDatabase,
     private vectorDB: SemanticVectorDB
@@ -114,13 +147,33 @@ export class SemanticEngine implements ISemanticEngine {
 
     if (!this.initializationPromise) {
       this.initializationPromise = globalProfiler.timeAsync('RustAnalyzer.initialization', async () => {
-        this.rustAnalyzer = new SemanticAnalyzer();
+        // Wrap Rust FFI initialization with retry for transient failures
+        // (library loading issues, resource constraints, etc.)
+        await withRetry(
+          async () => {
+            this.rustAnalyzer = new SemanticAnalyzer();
+          },
+          RetryPresets.fast, // Fast retries for local FFI - failures are usually quick
+          'SemanticEngine.initializeRustAnalyzer'
+        );
       });
     }
 
     await this.initializationPromise;
   }
 
+  /**
+   * Analyzes a codebase for languages, frameworks, complexity, and semantic concepts.
+   *
+   * Results are cached for 5 minutes to avoid redundant analysis.
+   * Uses circuit breaker pattern with TypeScript fallback on Rust failures.
+   *
+   * @param path - Absolute path to the codebase directory
+   * @returns Analysis result with languages, frameworks, concepts, and complexity metrics
+   *
+   * @thread-safe Multiple concurrent calls are safe (results are cached)
+   * @throws Error if analysis fails and fallback also fails
+   */
   async analyzeCodebase(path: string): Promise<CodebaseAnalysisResult> {
     return globalProfiler.timeAsync('SemanticEngine.analyzeCodebase', async () => {
       // Check cache first
@@ -171,6 +224,19 @@ export class SemanticEngine implements ISemanticEngine {
     });
   }
 
+  /**
+   * Analyzes the content of a single file for semantic concepts.
+   *
+   * Results are cached based on content hash for 5 minutes.
+   * Accumulates concepts in the Rust analyzer's internal state.
+   *
+   * @param filePath - Path to the file (used for language detection)
+   * @param content - File content to analyze
+   * @returns Array of extracted semantic concepts
+   *
+   * @thread-safe Multiple concurrent calls are safe (results are cached)
+   * @note Modifies internal Rust state - concepts are accumulated
+   */
   async analyzeFileContent(filePath: string, content: string): Promise<FileAnalysisResult['concepts']> {
     return globalProfiler.timeAsync('SemanticEngine.analyzeFileContent', async () => {
       // Create cache key based on file path and content hash
@@ -202,8 +268,7 @@ export class SemanticEngine implements ISemanticEngine {
         },
         // Fallback to pattern-based analysis
         async () => {
-          console.warn('⚠️  FALLBACK: Using limited pattern-based file analysis');
-          console.warn('   This means reduced accuracy and missed concepts');
+          Logger.warn('FALLBACK: Using limited pattern-based file analysis. This means reduced accuracy and missed concepts', { filePath });
           return this.fallbackFileAnalysis(filePath, content);
         }
       );
@@ -215,6 +280,25 @@ export class SemanticEngine implements ISemanticEngine {
     });
   }
 
+  /**
+   * Learns semantic concepts from an entire codebase.
+   *
+   * This is a long-running operation (may take several minutes for large codebases).
+   * Has a 5-minute timeout to prevent hanging. Progress is reported via callback.
+   *
+   * Learned concepts are:
+   * 1. Stored in the SQLite database for persistence
+   * 2. Indexed in the vector database for semantic search
+   * 3. Accumulated in the Rust analyzer's internal state
+   *
+   * @param path - Absolute path to the codebase directory
+   * @param progressCallback - Optional callback for progress updates
+   * @returns Array of learned semantic concepts with relationships
+   *
+   * @thread-safe But should complete before calling reset()
+   * @note Significantly modifies internal Rust state
+   * @warning Do not call reset() while learning is in progress
+   */
   async learnFromCodebase(path: string, progressCallback?: (current: number, total: number, message: string) => void): Promise<Array<{
     id: string;
     name: string;
@@ -225,7 +309,7 @@ export class SemanticEngine implements ISemanticEngine {
     relationships: Record<string, any>;
   }>> {
     try {
-      console.error(`🧠 Starting semantic learning for: ${path}`);
+      Logger.info('Starting semantic learning', { path });
 
       // Ensure Rust analyzer is initialized
       await this.initializeRustAnalyzer();
@@ -234,17 +318,22 @@ export class SemanticEngine implements ISemanticEngine {
       let estimatedFiles = 0;
       try {
         const glob = (await import('glob')).glob;
-        const files = await glob('**/*.{ts,tsx,js,jsx,py,rs,go,java,c,cpp,svelte,vue,php,phtml,inc}', {
-          cwd: path,
-          ignore: ['**/node_modules/**', '**/dist/**', '**/build/**', '**/.git/**'],
-          nodir: true
-        });
+        // Wrap glob operation with retry for transient file system issues
+        const files = await withRetry(
+          async () => glob('**/*.{ts,tsx,js,jsx,py,rs,go,java,c,cpp,svelte,vue,php,phtml,inc}', {
+            cwd: path,
+            ignore: ['**/node_modules/**', '**/dist/**', '**/build/**', '**/.git/**'],
+            nodir: true
+          }),
+          RetryPresets.fast, // Fast retries for local file system operations
+          'SemanticEngine.learnFromCodebase.glob'
+        );
         estimatedFiles = files.length;
         if (progressCallback && estimatedFiles > 0) {
           progressCallback(0, estimatedFiles, 'Starting semantic analysis...');
         }
       } catch (error) {
-        console.warn('Failed to estimate file count for progress tracking');
+        Logger.warn('Failed to estimate file count for progress tracking', { path });
       }
 
       // Add timeout protection for the entire learning process with periodic progress updates
@@ -285,7 +374,7 @@ export class SemanticEngine implements ISemanticEngine {
         progressCallback(estimatedFiles, estimatedFiles, 'Semantic analysis complete');
       }
 
-      console.error(`✅ Learned ${concepts.length} concepts from codebase`);
+      Logger.info('Learned concepts from codebase', { conceptCount: concepts.length });
 
       // Store in vector database for semantic search
       await this.vectorDB.initialize();
@@ -344,18 +433,18 @@ export class SemanticEngine implements ISemanticEngine {
                 }
               );
             } catch (vectorError) {
-              console.warn('Failed to store vector embedding:', vectorError);
+              Logger.warn('Failed to store vector embedding', { conceptName: concept.name, error: vectorError instanceof Error ? vectorError.message : String(vectorError) });
             }
           }
         } catch (conceptError) {
-          console.warn(`Failed to store concept ${concept.name}:`, conceptError);
+          Logger.warn('Failed to store concept', { conceptName: concept.name, error: conceptError instanceof Error ? conceptError.message : String(conceptError) });
           // Continue processing other concepts
         }
       }
 
       return result;
     } catch (error: unknown) {
-      console.error('Learning error:', error);
+      Logger.error('Learning error', error instanceof Error ? error : new Error(String(error)));
 
       // Provide more specific error messages for common issues
       if ((error instanceof Error && error.message.includes('timeout')) || (error instanceof Error && error.message.includes('timed out'))) {
@@ -372,6 +461,17 @@ export class SemanticEngine implements ISemanticEngine {
     }
   }
 
+  /**
+   * Updates the analyzer's internal state from analysis data.
+   *
+   * Used when file changes are detected to incrementally update
+   * the semantic knowledge without full re-analysis.
+   *
+   * @param analysisData - Analysis data containing change information
+   *
+   * @thread-safe Sequential calls are serialized by NAPI
+   * @note Modifies internal Rust state
+   */
   async updateFromAnalysis(analysisData: AnalysisUpdateData): Promise<void> {
     try {
       // Update the Rust analyzer with new analysis data
@@ -406,19 +506,36 @@ export class SemanticEngine implements ISemanticEngine {
         }
       }
     } catch (error) {
-      console.error('Failed to update from analysis:', error);
+      Logger.error('Failed to update from analysis', error instanceof Error ? error : new Error(String(error)));
     }
   }
 
+  /**
+   * Finds concepts related to a given concept by ID.
+   *
+   * @param conceptId - The ID of the concept to find relationships for
+   * @returns Array of related concept IDs
+   *
+   * @thread-safe Read-only operation on Rust state
+   */
   async findRelatedConcepts(conceptId: string): Promise<string[]> {
     try {
       return await this.rustAnalyzer.getConceptRelationships(conceptId);
     } catch (error) {
-      console.error('Failed to get relationships:', error);
+      Logger.error('Failed to get relationships', error instanceof Error ? error : new Error(String(error)), { conceptId });
       return [];
     }
   }
 
+  /**
+   * Searches for semantically similar concepts using vector embeddings.
+   *
+   * @param query - Natural language query to search for
+   * @param limit - Maximum number of results to return (default: 5)
+   * @returns Array of matching concepts with similarity scores
+   *
+   * @thread-safe Uses independent vector database
+   */
   async searchSemanticallySimilar(query: string, limit: number = 5): Promise<Array<{
     concept: string;
     similarity: number;
@@ -434,20 +551,23 @@ export class SemanticEngine implements ISemanticEngine {
         filePath: result.metadata.filePath
       }));
     } catch (error) {
-      console.error('Semantic search error:', error);
+      Logger.error('Semantic search error', error instanceof Error ? error : new Error(String(error)), { query, limit });
       return [];
     }
   }
 
   private async fallbackAnalysis(path: string): Promise<CodebaseAnalysisResult> {
     // Provide limited analysis but be very explicit about limitations
-    console.warn('⚠️  SEMANTIC ANALYSIS DEGRADED for', path);
-    console.warn('   Using basic file system analysis only:');
-    console.warn('   • No AST-based semantic concept extraction');
-    console.warn('   • No framework detection from dependencies');
-    console.warn('   • No complexity metrics calculation');
-    console.warn('   • No cross-file relationship analysis');
-    console.warn('   • Results will be extremely limited');
+    Logger.warn('SEMANTIC ANALYSIS DEGRADED - Using basic file system analysis only', {
+      path,
+      limitations: [
+        'No AST-based semantic concept extraction',
+        'No framework detection from dependencies',
+        'No complexity metrics calculation',
+        'No cross-file relationship analysis',
+        'Results will be extremely limited'
+      ]
+    });
     
     return {
       languages: ['analysis_failed'], // Explicitly indicates failure
@@ -465,7 +585,7 @@ export class SemanticEngine implements ISemanticEngine {
 
   private fallbackFileAnalysis(filePath: string, content: string): FileAnalysisResult['concepts'] {
     // Instead of fake analysis, provide limited but honest results
-    console.warn(`⚠️  Using limited pattern-based analysis for ${filePath} (Rust analyzer unavailable)`);
+    Logger.warn('Using limited pattern-based analysis (Rust analyzer unavailable)', { filePath });
     
     const concepts: FileAnalysisResult['concepts'] = [];
     const lines = content.split('\n');
@@ -498,10 +618,14 @@ export class SemanticEngine implements ISemanticEngine {
 
     // Be explicit about limitations
     if (concepts.length === 0) {
-      console.warn(`⚠️  No concepts detected in ${filePath} using fallback analysis. This may indicate:`);
-      console.warn('   • File uses patterns not detectable by regex');
-      console.warn('   • File contains complex syntax requiring AST parsing');
-      console.warn('   • File is not a source code file');
+      Logger.warn('No concepts detected using fallback analysis', {
+        filePath,
+        possibleReasons: [
+          'File uses patterns not detectable by regex',
+          'File contains complex syntax requiring AST parsing',
+          'File is not a source code file'
+        ]
+      });
     }
 
     return concepts;
@@ -601,7 +725,7 @@ export class SemanticEngine implements ISemanticEngine {
 
             // Ensure path is within project boundaries
             if (!resolved.startsWith(resolvedProject)) {
-              console.warn(`⚠️  Path traversal detected: ${relPath}`);
+              Logger.warn('Path traversal detected', { relPath, projectPath });
               return false;
             }
 
@@ -662,11 +786,10 @@ export class SemanticEngine implements ISemanticEngine {
 
         return entryPoints;
       } catch (error) {
-        console.warn('⚠️  Entry point detection failed:', error instanceof Error ? error.message : 'Unknown error');
-        console.warn('   Blueprint may be incomplete. This could indicate:');
-        console.warn('   • Invalid project path');
-        console.warn('   • Permission issues');
-        console.warn('   • Unsupported project structure');
+        Logger.warn('Entry point detection failed - Blueprint may be incomplete', {
+          error: error instanceof Error ? error.message : 'Unknown error',
+          possibleCauses: ['Invalid project path', 'Permission issues', 'Unsupported project structure']
+        });
         return [];
       }
     };
@@ -760,8 +883,9 @@ export class SemanticEngine implements ISemanticEngine {
 
         return keyDirectories;
       } catch (error) {
-        console.warn('⚠️  Failed to map key directories:', error instanceof Error ? error.message : 'Unknown error');
-        console.warn('   Blueprint may be incomplete');
+        Logger.warn('Failed to map key directories - Blueprint may be incomplete', {
+          error: error instanceof Error ? error.message : 'Unknown error'
+        });
         return [];
       }
     };
@@ -820,7 +944,13 @@ export class SemanticEngine implements ISemanticEngine {
   }
 
   /**
-   * Clean up resources to prevent process hanging
+   * Cleans up resources to prevent process hanging.
+   *
+   * Should be called when the engine is no longer needed.
+   * Clears the periodic cleanup interval and all caches.
+   *
+   * @thread-safe Can be called at any time
+   * @note Does NOT call reset() on the Rust analyzer - internal state is preserved
    */
   cleanup(): void {
     if (this.cleanupInterval) {

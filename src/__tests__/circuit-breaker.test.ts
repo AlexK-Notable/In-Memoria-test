@@ -118,43 +118,182 @@ describe('CircuitBreaker', () => {
 
   describe('half-open state and recovery', () => {
     it('should transition to HALF_OPEN after recovery timeout', async () => {
+      // Use successThreshold: 1 for backward compatibility test
+      const singleSuccessBreaker = new CircuitBreaker({
+        failureThreshold: 3,
+        recoveryTimeout: 100,
+        requestTimeout: 50,
+        monitoringWindow: 1000,
+        successThreshold: 1
+      });
+
       // Open the circuit
       const failingOperation = vi.fn().mockRejectedValue(new Error('Failure'));
       for (let i = 0; i < 3; i++) {
-        await expect(circuitBreaker.execute(failingOperation)).rejects.toThrow();
+        await expect(singleSuccessBreaker.execute(failingOperation)).rejects.toThrow();
       }
-      
-      expect(circuitBreaker.getStats().state).toBe(CircuitState.OPEN);
-      
+
+      expect(singleSuccessBreaker.getStats().state).toBe(CircuitState.OPEN);
+
       // Wait for recovery timeout
       await new Promise(resolve => setTimeout(resolve, 150));
-      
-      // Next operation should transition to HALF_OPEN
+
+      // Next operation should transition to HALF_OPEN and then CLOSED (with successThreshold: 1)
       const successOperation = vi.fn().mockResolvedValue('success');
-      const result = await circuitBreaker.execute(successOperation);
-      
+      const result = await singleSuccessBreaker.execute(successOperation);
+
       expect(result).toBe('success');
-      expect(circuitBreaker.getStats().state).toBe(CircuitState.CLOSED);
+      expect(singleSuccessBreaker.getStats().state).toBe(CircuitState.CLOSED);
     });
 
     it('should stay closed after successful recovery', async () => {
+      // Use successThreshold: 1 for backward compatibility test
+      const singleSuccessBreaker = new CircuitBreaker({
+        failureThreshold: 3,
+        recoveryTimeout: 100,
+        requestTimeout: 50,
+        monitoringWindow: 1000,
+        successThreshold: 1
+      });
+
+      // Open the circuit
+      const failingOperation = vi.fn().mockRejectedValue(new Error('Failure'));
+      for (let i = 0; i < 3; i++) {
+        await expect(singleSuccessBreaker.execute(failingOperation)).rejects.toThrow();
+      }
+
+      // Wait and recover
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      const successOperation = vi.fn().mockResolvedValue('success');
+      await singleSuccessBreaker.execute(successOperation);
+
+      expect(singleSuccessBreaker.getStats().state).toBe(CircuitState.CLOSED);
+
+      // Should stay closed for subsequent operations
+      await singleSuccessBreaker.execute(successOperation);
+      expect(singleSuccessBreaker.getStats().state).toBe(CircuitState.CLOSED);
+    });
+  });
+
+  describe('HALF_OPEN success threshold', () => {
+    it('should require multiple consecutive successes to close circuit (default threshold: 3)', async () => {
+      // Default circuitBreaker has successThreshold: 3
       // Open the circuit
       const failingOperation = vi.fn().mockRejectedValue(new Error('Failure'));
       for (let i = 0; i < 3; i++) {
         await expect(circuitBreaker.execute(failingOperation)).rejects.toThrow();
       }
-      
-      // Wait and recover
+      expect(circuitBreaker.getStats().state).toBe(CircuitState.OPEN);
+
+      // Wait for recovery timeout
       await new Promise(resolve => setTimeout(resolve, 150));
-      
+
       const successOperation = vi.fn().mockResolvedValue('success');
+
+      // First success - should still be HALF_OPEN
       await circuitBreaker.execute(successOperation);
-      
-      expect(circuitBreaker.getStats().state).toBe(CircuitState.CLOSED);
-      
-      // Should stay closed for subsequent operations
+      expect(circuitBreaker.getStats().state).toBe(CircuitState.HALF_OPEN);
+
+      // Second success - still HALF_OPEN
+      await circuitBreaker.execute(successOperation);
+      expect(circuitBreaker.getStats().state).toBe(CircuitState.HALF_OPEN);
+
+      // Third success - NOW should be CLOSED
       await circuitBreaker.execute(successOperation);
       expect(circuitBreaker.getStats().state).toBe(CircuitState.CLOSED);
+    });
+
+    it('should reset success counter on HALF_OPEN failure', async () => {
+      // Open the circuit
+      const failingOperation = vi.fn().mockRejectedValue(new Error('Failure'));
+      for (let i = 0; i < 3; i++) {
+        await expect(circuitBreaker.execute(failingOperation)).rejects.toThrow();
+      }
+      expect(circuitBreaker.getStats().state).toBe(CircuitState.OPEN);
+
+      // Wait for recovery timeout
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      const successOperation = vi.fn().mockResolvedValue('success');
+
+      // Two successes
+      await circuitBreaker.execute(successOperation);
+      await circuitBreaker.execute(successOperation);
+      expect(circuitBreaker.getStats().state).toBe(CircuitState.HALF_OPEN);
+
+      // Failure - should go back to OPEN
+      await expect(circuitBreaker.execute(failingOperation)).rejects.toThrow();
+      expect(circuitBreaker.getStats().state).toBe(CircuitState.OPEN);
+    });
+
+    it('should respect custom success threshold', async () => {
+      const customBreaker = new CircuitBreaker({
+        failureThreshold: 2,
+        recoveryTimeout: 100,
+        requestTimeout: 50,
+        monitoringWindow: 1000,
+        successThreshold: 2
+      });
+
+      // Open the circuit
+      const failingOperation = vi.fn().mockRejectedValue(new Error('Failure'));
+      for (let i = 0; i < 2; i++) {
+        await expect(customBreaker.execute(failingOperation)).rejects.toThrow();
+      }
+      expect(customBreaker.getStats().state).toBe(CircuitState.OPEN);
+
+      // Wait for recovery timeout
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      const successOperation = vi.fn().mockResolvedValue('success');
+
+      // First success - should still be HALF_OPEN
+      await customBreaker.execute(successOperation);
+      expect(customBreaker.getStats().state).toBe(CircuitState.HALF_OPEN);
+
+      // Second success - should now be CLOSED
+      await customBreaker.execute(successOperation);
+      expect(customBreaker.getStats().state).toBe(CircuitState.CLOSED);
+    });
+
+    it('should require full success count after failure resets counter', async () => {
+      const customBreaker = new CircuitBreaker({
+        failureThreshold: 2,
+        recoveryTimeout: 100,
+        requestTimeout: 50,
+        monitoringWindow: 1000,
+        successThreshold: 2
+      });
+
+      // Open the circuit
+      const failingOperation = vi.fn().mockRejectedValue(new Error('Failure'));
+      for (let i = 0; i < 2; i++) {
+        await expect(customBreaker.execute(failingOperation)).rejects.toThrow();
+      }
+
+      // Wait for recovery timeout
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      const successOperation = vi.fn().mockResolvedValue('success');
+
+      // One success
+      await customBreaker.execute(successOperation);
+      expect(customBreaker.getStats().state).toBe(CircuitState.HALF_OPEN);
+
+      // Failure - resets counter
+      await expect(customBreaker.execute(failingOperation)).rejects.toThrow();
+      expect(customBreaker.getStats().state).toBe(CircuitState.OPEN);
+
+      // Wait again for recovery
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      // Need TWO successes again (not just one to complete the previous count)
+      await customBreaker.execute(successOperation);
+      expect(customBreaker.getStats().state).toBe(CircuitState.HALF_OPEN);
+
+      await customBreaker.execute(successOperation);
+      expect(customBreaker.getStats().state).toBe(CircuitState.CLOSED);
     });
   });
 
@@ -191,7 +330,7 @@ describe('Pre-configured Circuit Breakers', () => {
     it('should create circuit breaker with appropriate settings', () => {
       const cb = createOpenAICircuitBreaker();
       const stats = cb.getStats();
-      
+
       expect(stats.state).toBe(CircuitState.CLOSED);
       // Should be configured for external API calls (more tolerant)
     });
@@ -201,9 +340,223 @@ describe('Pre-configured Circuit Breakers', () => {
     it('should create circuit breaker with appropriate settings', () => {
       const cb = createRustAnalyzerCircuitBreaker();
       const stats = cb.getStats();
-      
+
       expect(stats.state).toBe(CircuitState.CLOSED);
       // Should be configured for internal operations (less tolerant)
+    });
+  });
+});
+
+describe('CircuitBreakerError', () => {
+  it('should include error details in toString output', () => {
+    const error = new CircuitBreakerError(
+      'Test error',
+      {
+        message: 'Circuit is open',
+        state: CircuitState.OPEN,
+        failures: 5,
+      },
+      {
+        failureThreshold: 3,
+        recoveryTimeout: 1000,
+        requestTimeout: 500,
+        monitoringWindow: 10000,
+      }
+    );
+
+    const str = error.toString();
+    expect(str).toContain('CircuitBreakerError');
+    expect(str).toContain('Test error');
+    expect(str).toContain('Details');
+    // JSON.stringify with 2-space indent includes spaces
+    expect(str).toContain('"state": "OPEN"');
+    expect(str).toContain('"failures": 5');
+  });
+
+  it('should expose error details and options', () => {
+    const details = {
+      message: 'Test details',
+      state: CircuitState.HALF_OPEN,
+      failures: 2,
+    };
+    const options = {
+      failureThreshold: 3,
+      recoveryTimeout: 1000,
+      requestTimeout: 500,
+      monitoringWindow: 10000,
+    };
+
+    const error = new CircuitBreakerError('Error message', details, options);
+
+    expect(error.details).toEqual(details);
+    expect(error.options).toEqual(options);
+    expect(error.name).toBe('CircuitBreakerError');
+    expect(error.message).toBe('Error message');
+  });
+});
+
+describe('CircuitBreaker edge cases', () => {
+  describe('getDetailedErrorInfo calculations', () => {
+    it('should calculate success rate correctly', async () => {
+      const cb = new CircuitBreaker({
+        failureThreshold: 3,
+        recoveryTimeout: 100,
+        requestTimeout: 50,
+        monitoringWindow: 1000
+      });
+
+      // Execute successful operations
+      const successOp = vi.fn().mockResolvedValue('success');
+      await cb.execute(successOp);
+      await cb.execute(successOp);
+
+      // Execute a failing operation with fallback to get error details
+      const failOp = vi.fn().mockRejectedValue(new Error('fail'));
+      await cb.execute(failOp, async () => 'fallback');
+
+      const stats = cb.getStats();
+      expect(stats.successes).toBe(2);
+      expect(stats.totalRequests).toBe(3);
+    });
+
+    it('should calculate timeSinceLastFailure', async () => {
+      const cb = new CircuitBreaker({
+        failureThreshold: 5, // High threshold to stay in CLOSED
+        recoveryTimeout: 100,
+        requestTimeout: 50,
+        monitoringWindow: 1000
+      });
+
+      // Cause a failure to set lastFailureTime
+      const failOp = vi.fn().mockRejectedValue(new Error('fail'));
+      try {
+        await cb.execute(failOp);
+      } catch {
+        // Expected
+      }
+
+      // Wait a bit
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // Get stats to verify lastFailureTime is set
+      const stats = cb.getStats();
+      expect(stats.lastFailureTime).toBeDefined();
+      expect(Date.now() - stats.lastFailureTime!).toBeGreaterThanOrEqual(45);
+    });
+
+    it('should handle case when lastFailureTime is undefined', async () => {
+      const cb = new CircuitBreaker({
+        failureThreshold: 3,
+        recoveryTimeout: 100,
+        requestTimeout: 50,
+        monitoringWindow: 1000
+      });
+
+      // Only successful operations
+      const successOp = vi.fn().mockResolvedValue('success');
+      await cb.execute(successOp);
+
+      const stats = cb.getStats();
+      expect(stats.lastFailureTime).toBeUndefined();
+    });
+
+    it('should calculate zero success rate when no requests', () => {
+      const cb = new CircuitBreaker({
+        failureThreshold: 3,
+        recoveryTimeout: 100,
+        requestTimeout: 50,
+        monitoringWindow: 1000
+      });
+
+      const stats = cb.getStats();
+      expect(stats.totalRequests).toBe(0);
+      expect(stats.successes).toBe(0);
+    });
+  });
+
+  describe('monitoring window cleanup', () => {
+    it('should clean old failures outside monitoring window', async () => {
+      const cb = new CircuitBreaker({
+        failureThreshold: 5,
+        recoveryTimeout: 100,
+        requestTimeout: 50,
+        monitoringWindow: 100 // Short window
+      });
+
+      const failOp = vi.fn().mockRejectedValue(new Error('fail'));
+
+      // Cause failures
+      await expect(cb.execute(failOp)).rejects.toThrow();
+      await expect(cb.execute(failOp)).rejects.toThrow();
+
+      let stats = cb.getStats();
+      expect(stats.failures).toBe(2);
+
+      // Wait for monitoring window to pass
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      // Next request should clean old failures
+      const successOp = vi.fn().mockResolvedValue('success');
+      await cb.execute(successOp);
+
+      stats = cb.getStats();
+      expect(stats.failures).toBe(0); // Old failures cleaned
+    });
+  });
+
+  describe('half-open to open transition', () => {
+    it('should return to OPEN if operation fails during HALF_OPEN', async () => {
+      const cb = new CircuitBreaker({
+        failureThreshold: 2,
+        recoveryTimeout: 100,
+        requestTimeout: 50,
+        monitoringWindow: 1000,
+        successThreshold: 2
+      });
+
+      // Open the circuit
+      const failOp = vi.fn().mockRejectedValue(new Error('fail'));
+      await expect(cb.execute(failOp)).rejects.toThrow();
+      await expect(cb.execute(failOp)).rejects.toThrow();
+      expect(cb.getStats().state).toBe(CircuitState.OPEN);
+
+      // Wait for recovery
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      // Trigger HALF_OPEN by making a request that fails
+      await expect(cb.execute(failOp)).rejects.toThrow();
+
+      // Should be back to OPEN
+      expect(cb.getStats().state).toBe(CircuitState.OPEN);
+    });
+  });
+
+  describe('concurrent operations', () => {
+    it('should handle multiple concurrent operations', async () => {
+      const cb = new CircuitBreaker({
+        failureThreshold: 10,
+        recoveryTimeout: 100,
+        requestTimeout: 100,
+        monitoringWindow: 1000
+      });
+
+      const successOp = vi.fn().mockImplementation(
+        () => new Promise(resolve => setTimeout(() => resolve('success'), 10))
+      );
+
+      // Run multiple operations concurrently
+      const results = await Promise.all([
+        cb.execute(successOp),
+        cb.execute(successOp),
+        cb.execute(successOp),
+        cb.execute(successOp),
+        cb.execute(successOp),
+      ]);
+
+      expect(results).toHaveLength(5);
+      results.forEach(r => expect(r).toBe('success'));
+      expect(cb.getStats().totalRequests).toBe(5);
+      expect(cb.getStats().successes).toBe(5);
     });
   });
 });

@@ -367,3 +367,62 @@ export interface IRustBridgeService {
    */
   forceReset(): void;
 }
+
+// ============================================================================
+// Vector Database Interface
+// ============================================================================
+
+/**
+ * Metadata for code stored in the vector database
+ */
+export interface CodeMetadata {
+  id: string;
+  filePath: string;
+  functionName?: string;
+  className?: string;
+  language: string;
+  complexity: number;
+  lineCount: number;
+  lastModified: Date;
+}
+
+/**
+ * Result from semantic similarity search in vector database
+ */
+export interface VectorSearchResult {
+  id: string;
+  code: string;
+  metadata: CodeMetadata;
+  similarity: number;
+}
+
+/**
+ * Interface for vector database operations.
+ * Enables dependency injection and testing with mock vector storage.
+ */
+export interface IVectorDatabase {
+  /**
+   * Initialize the vector database with a collection name
+   */
+  initialize(collectionName?: string): Promise<void>;
+
+  /**
+   * Store a code embedding with metadata
+   */
+  storeCodeEmbedding(code: string, metadata: CodeMetadata): Promise<void>;
+
+  /**
+   * Store multiple code embeddings in batch
+   */
+  storeMultipleEmbeddings(codeChunks: string[], metadataList: CodeMetadata[]): Promise<void>;
+
+  /**
+   * Find similar code based on semantic similarity
+   */
+  findSimilarCode(query: string, limit?: number, filters?: Record<string, unknown>): Promise<VectorSearchResult[]>;
+
+  /**
+   * Close the database connection and clean up resources
+   */
+  close(): Promise<void>;
+}

@@ -3,6 +3,7 @@ import { SQLiteDatabase, DeveloperPattern } from '../storage/sqlite-db.js';
 import { FileChange } from '../watchers/file-watcher.js';
 import { CircuitBreaker, createRustAnalyzerCircuitBreaker } from '../utils/circuit-breaker.js';
 import { nanoid } from 'nanoid';
+import { Logger } from '../utils/logger.js';
 import type { IPatternEngine } from '../interfaces/engines.js';
 
 // Local types for Rust binding results
@@ -67,15 +68,53 @@ export interface RelevantPattern {
   confidence: number;
 }
 
+/**
+ * Pattern analysis engine wrapping Rust FFI for pattern discovery and learning.
+ *
+ * ## Thread Safety
+ *
+ * This class provides a thread-safe wrapper around the Rust PatternLearner.
+ * The underlying Rust instance is protected by NAPI's event loop serialization,
+ * meaning all JavaScript calls are processed sequentially.
+ *
+ * **Safe operations:**
+ * - Creating multiple PatternEngine instances (each has independent Rust state)
+ * - Calling any method sequentially on the same instance
+ * - Concurrent calls to different instances
+ *
+ * **Unsafe patterns:**
+ * - Sharing the underlying rustLearner across Worker threads
+ * - Calling methods without awaiting (loses ordering guarantees)
+ *
+ * @see docs/FFI_THREAD_SAFETY.md for detailed thread safety documentation
+ */
 export class PatternEngine implements IPatternEngine {
   private rustLearner: InstanceType<typeof PatternLearner>;
   private rustCircuitBreaker: CircuitBreaker;
 
+  /**
+   * Creates a new PatternEngine instance.
+   *
+   * Each instance maintains its own Rust PatternLearner and circuit breaker.
+   * Instances are completely independent and can be used concurrently.
+   *
+   * @param database - SQLite database for persisting developer patterns
+   *
+   * @thread-safe Instance creation is always safe
+   */
   constructor(private database: SQLiteDatabase) {
     this.rustLearner = new PatternLearner();
     this.rustCircuitBreaker = createRustAnalyzerCircuitBreaker();
   }
 
+  /**
+   * Extracts patterns from a codebase at the given path.
+   *
+   * @param path - Absolute path to the codebase directory
+   * @returns Array of extracted patterns with type, description, and frequency
+   *
+   * @thread-safe Read-heavy operation, safe for concurrent instances
+   */
   async extractPatterns(path: string): Promise<PatternExtractionResult[]> {
     try {
       const patterns = await this.rustLearner.extractPatterns(path);
@@ -85,11 +124,20 @@ export class PatternEngine implements IPatternEngine {
         frequency: p.frequency
       }));
     } catch (error) {
-      console.error('Pattern extraction error:', error);
+      Logger.error('Pattern extraction error', error instanceof Error ? error : new Error(String(error)), { path });
       return this.fallbackPatternExtraction(path);
     }
   }
 
+  /**
+   * Analyzes patterns in a single file.
+   *
+   * @param filePath - Path to the file (used for language detection)
+   * @param content - File content to analyze
+   * @returns Array of detected patterns with type, description, and confidence
+   *
+   * @thread-safe Sequential calls are serialized by NAPI
+   */
   async analyzeFilePatterns(filePath: string, content: string): Promise<Array<{
     type: string;
     description: string;
@@ -116,7 +164,7 @@ export class PatternEngine implements IPatternEngine {
         };
       });
     } catch (error) {
-      console.error('File pattern analysis error:', error);
+      Logger.error('File pattern analysis error', error instanceof Error ? error : new Error(String(error)), { filePath });
       return this.fallbackFilePatternAnalysis(content, filePath);
     }
   }
@@ -217,6 +265,20 @@ export class PatternEngine implements IPatternEngine {
     return patterns;
   }
 
+  /**
+   * Learns patterns from an entire codebase.
+   *
+   * This is a long-running operation. Progress is reported via callback.
+   * Learned patterns are stored in the SQLite database for persistence.
+   *
+   * @param path - Absolute path to the codebase directory
+   * @param progressCallback - Optional callback for progress updates
+   * @returns Array of learned patterns with examples and contexts
+   *
+   * @thread-safe But should complete before calling reset()
+   * @note Significantly modifies internal Rust state
+   * @warning Do not call reset() while learning is in progress
+   */
   async learnFromCodebase(path: string, progressCallback?: (current: number, total: number, message: string) => void): Promise<Array<{
     id: string;
     type: string;
@@ -292,15 +354,19 @@ export class PatternEngine implements IPatternEngine {
         }
       }
 
-      console.log(`✅ Pattern learning completed: ${result.length} patterns discovered`);
+      Logger.info('Pattern learning completed', { patternCount: result.length });
       return result;
     } catch (error) {
-      console.error('❌ Pattern learning failed:', error);
-      console.warn('🔄 Pattern learning degraded to basic regex detection:');
-      console.warn('   • Advanced ML pattern detection unavailable');
-      console.warn('   • Rust pattern learning engine not accessible');
-      console.warn('   • Using simple heuristic-based pattern detection');
-      console.warn(`   • Analysis quality significantly reduced for: ${path}`);
+      Logger.error('Pattern learning failed', error instanceof Error ? error : new Error(String(error)), { path });
+      Logger.warn('Pattern learning degraded to basic regex detection', {
+        limitations: [
+          'Advanced ML pattern detection unavailable',
+          'Rust pattern learning engine not accessible',
+          'Using simple heuristic-based pattern detection',
+          'Analysis quality significantly reduced'
+        ],
+        path
+      });
       
       if (progressCallback) {
         progressCallback(100, 100, 'Pattern learning failed (degraded mode)');
@@ -311,6 +377,18 @@ export class PatternEngine implements IPatternEngine {
     }
   }
 
+  /**
+   * Analyzes patterns in a file change event.
+   *
+   * Detects patterns, violations, and generates recommendations
+   * based on the change content and type.
+   *
+   * @param change - File change event with type, path, content, and language
+   * @returns Analysis result with detected patterns, violations, and recommendations
+   *
+   * @thread-safe Sequential calls are serialized by NAPI
+   * @note May modify internal Rust state based on learned patterns
+   */
   async analyzeFileChange(change: FileChange): Promise<PatternAnalysisResult> {
     try {
       const changeData = JSON.stringify({
@@ -335,11 +413,24 @@ export class PatternEngine implements IPatternEngine {
         }))
       };
     } catch (error) {
-      console.error('File change analysis error:', error);
+      Logger.error('File change analysis error', error instanceof Error ? error : new Error(String(error)), { filePath: change.path });
       return this.fallbackChangeAnalysis(change);
     }
   }
 
+  /**
+   * Finds patterns relevant to a given problem description.
+   *
+   * Uses keyword matching and confidence scoring to rank patterns
+   * from the database by relevance to the problem.
+   *
+   * @param problemDescription - Description of the problem to solve
+   * @param _currentFile - Optional current file context (unused)
+   * @param _selectedCode - Optional selected code context (unused)
+   * @returns Array of relevant patterns ranked by score (max 10)
+   *
+   * @thread-safe Read-only operation on database
+   */
   async findRelevantPatterns(
     problemDescription: string,
     _currentFile?: string,
@@ -418,6 +509,17 @@ export class PatternEngine implements IPatternEngine {
       .filter(word => word.length > 2 && !stopWords.has(word));
   }
 
+  /**
+   * Predicts the best approach for solving a problem.
+   *
+   * Uses learned patterns and context to suggest an implementation approach.
+   *
+   * @param problemDescription - Description of the problem to solve
+   * @param context - Additional context (e.g., current file, project info)
+   * @returns Prediction with approach, confidence, reasoning, patterns, and complexity
+   *
+   * @thread-safe Read-only operation on Rust state
+   */
   async predictApproach(
     problemDescription: string,
     context: Record<string, any>
@@ -445,11 +547,22 @@ export class PatternEngine implements IPatternEngine {
         complexity: prediction.complexity as 'low' | 'medium' | 'high'
       };
     } catch (error) {
-      console.error('Approach prediction error:', error);
+      Logger.error('Approach prediction error', error instanceof Error ? error : new Error(String(error)), { problemDescription: problemDescription.substring(0, 100) });
       return this.fallbackApproachPrediction(problemDescription);
     }
   }
 
+  /**
+   * Learns from analysis data to improve pattern recognition.
+   *
+   * Updates the Rust analyzer's internal model and persists patterns
+   * to the database for future reference.
+   *
+   * @param analysisData - Analysis data containing detected patterns
+   *
+   * @thread-safe Sequential calls are serialized by NAPI
+   * @note Modifies internal Rust state and database
+   */
   async learnFromAnalysis(analysisData: PatternAnalysisInput): Promise<void> {
     try {
       await this.rustLearner.learnFromAnalysis(JSON.stringify(analysisData));
@@ -485,10 +598,21 @@ export class PatternEngine implements IPatternEngine {
         }
       }
     } catch (error) {
-      console.error('Failed to learn from analysis:', error);
+      Logger.error('Failed to learn from analysis', error instanceof Error ? error : new Error(String(error)));
     }
   }
 
+  /**
+   * Updates pattern knowledge from a file change event.
+   *
+   * Incrementally updates the Rust analyzer and pattern usage statistics.
+   *
+   * @param change - File change event with type, path, content, and language
+   *
+   * @thread-safe Sequential calls are serialized by NAPI
+   * @note Modifies internal Rust state
+   * @warning Always await this method to maintain ordering guarantees
+   */
   async updateFromChange(change: FileChange): Promise<void> {
     try {
       const changeData = JSON.stringify({
@@ -504,7 +628,7 @@ export class PatternEngine implements IPatternEngine {
       // Update pattern usage statistics
       await this.updatePatternUsageStats(change);
     } catch (error) {
-      console.error('Failed to update from change:', error);
+      Logger.error('Failed to update from change', error instanceof Error ? error : new Error(String(error)), { filePath: change.path });
     }
   }
 
@@ -642,8 +766,15 @@ export class PatternEngine implements IPatternEngine {
   }
 
   /**
-   * Build feature map using Rust analyzer with TypeScript fallback
-   * Uses CircuitBreaker pattern for graceful degradation
+   * Builds a feature map for a project.
+   *
+   * Maps features to their primary and related files using Rust analyzer
+   * with TypeScript fallback. Uses circuit breaker for graceful degradation.
+   *
+   * @param projectPath - Absolute path to the project directory
+   * @returns Array of feature maps with files and dependencies
+   *
+   * @thread-safe Uses circuit breaker for Rust/TypeScript failover
    */
   async buildFeatureMap(projectPath: string): Promise<Array<{
     id: string;
@@ -770,8 +901,7 @@ export class PatternEngine implements IPatternEngine {
 
         return featureMap;
       } catch (error) {
-        console.error('⚠️  Feature mapping error:', error instanceof Error ? error.message : 'Unknown error');
-        console.warn('   Feature map may be incomplete');
+        Logger.error('Feature mapping error - Feature map may be incomplete', error instanceof Error ? error : new Error(String(error)));
         return [];
       }
     };
@@ -836,8 +966,16 @@ export class PatternEngine implements IPatternEngine {
   }
 
   /**
-   * Route request to files with confidence scoring
-   * Returns files ranked by relevance with confidence indicators
+   * Routes a request to the most relevant files in the project.
+   *
+   * Uses feature maps and keyword matching to suggest target files
+   * for implementing a feature or fixing a bug.
+   *
+   * @param problemDescription - Description of what needs to be done
+   * @param projectPath - Absolute path to the project directory
+   * @returns Routing suggestion with files, confidence, and reasoning, or null if no match
+   *
+   * @thread-safe Read-only operation on database
    */
   async routeRequestToFiles(
     problemDescription: string,
@@ -960,11 +1098,10 @@ export class PatternEngine implements IPatternEngine {
         };
       }
 
-      console.warn('⚠️  Could not route request - no features available');
+      Logger.warn('Could not route request - no features available', { problemDescription: problemDescription.substring(0, 100) });
       return null;
     } catch (error) {
-      console.error('⚠️  Request routing error:', error instanceof Error ? error.message : 'Unknown error');
-      console.warn('   Routing failed. Check if feature maps exist.');
+      Logger.error('Request routing error - Routing failed. Check if feature maps exist.', error instanceof Error ? error : new Error(String(error)));
       return null;
     }
   }
@@ -992,7 +1129,7 @@ export class PatternEngine implements IPatternEngine {
 
       return [...new Set(files)].slice(0, 10);
     } catch (error) {
-      console.error('Error finding files using patterns:', error);
+      Logger.error('Error finding files using patterns', error instanceof Error ? error : new Error(String(error)), { projectPath });
       return [];
     }
   }

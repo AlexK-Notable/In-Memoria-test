@@ -20,7 +20,7 @@ pub use naming::NamingPatternAnalyzer;
 pub use structural::StructuralPatternAnalyzer;
 pub use implementation::ImplementationPatternAnalyzer;
 pub use prediction::ApproachPredictor;
-pub use learning::PatternLearningEngine;
+pub use learning::{PatternLearningEngine, LearnerStats};
 
 // Legacy compatibility - re-export the main pattern learning functionality
 // through the new modular engine
@@ -212,13 +212,26 @@ impl PatternLearner {
     }
 
     /// Update pattern learner from change data (from original implementation)
-    /// 
+    ///
     /// # Safety
     /// This function is marked unsafe for NAPI compatibility. It performs data parsing and
     /// pattern update operations that are inherently safe but marked unsafe for JavaScript interop.
     #[cfg_attr(feature = "napi-bindings", napi)]
     pub async unsafe fn update_from_change(&mut self, change_data: String) -> Result<bool, crate::types::ParseError> {
         self.engine.update_from_change(change_data).await
+    }
+
+    /// Clear all accumulated state to free memory
+    /// Call this between analysis sessions to prevent unbounded memory growth
+    #[cfg_attr(feature = "napi-bindings", napi)]
+    pub fn reset(&mut self) {
+        self.engine.reset();
+    }
+
+    /// Get current memory usage statistics for monitoring
+    #[cfg_attr(feature = "napi-bindings", napi)]
+    pub fn get_stats(&self) -> learning::LearnerStats {
+        self.engine.get_stats()
     }
 
     // Helper methods from original implementation
@@ -623,5 +636,37 @@ mod tests {
         assert_eq!(example.file_path, "utils.ts");
         assert_eq!(example.line_range.start, 15);
         assert_eq!(example.line_range.end, 15);
+    }
+
+    #[test]
+    fn test_pattern_learner_reset() {
+        let mut learner = PatternLearner::new();
+
+        // Verify initial state
+        let initial_stats = learner.get_stats();
+        assert_eq!(initial_stats.patterns_count, 0);
+
+        // Add a pattern via the engine
+        let pattern = Pattern {
+            id: "test_wrapper".to_string(),
+            pattern_type: "test".to_string(),
+            description: "Test wrapper pattern".to_string(),
+            frequency: 1,
+            confidence: 0.7,
+            examples: vec![],
+            contexts: vec![],
+        };
+        learner.engine.insert_pattern("test_wrapper".to_string(), pattern);
+
+        // Verify state was accumulated
+        let stats_before = learner.get_stats();
+        assert_eq!(stats_before.patterns_count, 1);
+
+        // Reset through wrapper
+        learner.reset();
+
+        // Verify state was cleared
+        let stats_after = learner.get_stats();
+        assert_eq!(stats_after.patterns_count, 0);
     }
 }

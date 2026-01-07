@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { Logger } from '../utils/logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -409,6 +410,129 @@ export class DatabaseMigrator {
         ALTER TABLE project_metadata_old RENAME TO project_metadata;
       `
     });
+
+    // Migration 8: Schema reconciliation - add repository tables and optimize indexes
+    this.migrations.push({
+      version: 8,
+      name: 'schema_reconciliation',
+      up: `
+        -- ============================================================================
+        -- Repository Pattern Tables
+        -- These tables support the repository pattern abstraction layer
+        -- ============================================================================
+
+        -- Intelligence records for tracking project learning status
+        CREATE TABLE IF NOT EXISTS intelligence (
+          id TEXT PRIMARY KEY,
+          project_path TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          file_count INTEGER DEFAULT 0,
+          concept_count INTEGER DEFAULT 0,
+          pattern_count INTEGER DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          metadata TEXT
+        );
+
+        -- Pattern records for detected code patterns
+        CREATE TABLE IF NOT EXISTS patterns (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          type TEXT NOT NULL,
+          confidence REAL DEFAULT 0.0,
+          occurrences INTEGER DEFAULT 0,
+          project_path TEXT NOT NULL,
+          metadata TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+
+        -- Concept records for code concepts (classes, functions, etc.)
+        CREATE TABLE IF NOT EXISTS concepts (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          type TEXT NOT NULL,
+          file_path TEXT NOT NULL,
+          line_number INTEGER NOT NULL,
+          project_path TEXT NOT NULL,
+          metadata TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+
+        -- ============================================================================
+        -- Optimized Indexes for Query Patterns
+        -- ============================================================================
+
+        -- Developer patterns: covering index for common query pattern
+        CREATE INDEX IF NOT EXISTS idx_developer_patterns_type_freq_conf
+          ON developer_patterns(pattern_type, frequency DESC, confidence DESC);
+
+        -- AI insights: covering index for sorting
+        CREATE INDEX IF NOT EXISTS idx_ai_insights_type_conf_created
+          ON ai_insights(insight_type, confidence_score DESC, created_at DESC);
+
+        -- Feature map: composite index for active features lookup
+        CREATE INDEX IF NOT EXISTS idx_feature_map_project_status
+          ON feature_map(project_path, status) WHERE status = 'active';
+
+        -- Feature map: composite index for feature name lookup
+        CREATE INDEX IF NOT EXISTS idx_feature_map_project_name
+          ON feature_map(project_path, feature_name);
+
+        -- Work sessions: composite index for finding active sessions
+        CREATE INDEX IF NOT EXISTS idx_work_sessions_active
+          ON work_sessions(project_path, session_start DESC) WHERE session_end IS NULL;
+
+        -- Project decisions: index for ordering by made_at
+        CREATE INDEX IF NOT EXISTS idx_project_decisions_made
+          ON project_decisions(project_path, made_at DESC);
+
+        -- ============================================================================
+        -- Repository Pattern Table Indexes
+        -- ============================================================================
+
+        CREATE INDEX IF NOT EXISTS idx_intelligence_project ON intelligence(project_path);
+        CREATE INDEX IF NOT EXISTS idx_intelligence_status ON intelligence(status);
+
+        CREATE INDEX IF NOT EXISTS idx_patterns_project ON patterns(project_path);
+        CREATE INDEX IF NOT EXISTS idx_patterns_type ON patterns(type);
+        CREATE INDEX IF NOT EXISTS idx_patterns_project_type ON patterns(project_path, type);
+        CREATE INDEX IF NOT EXISTS idx_patterns_project_confidence
+          ON patterns(project_path, confidence DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_concepts_project ON concepts(project_path);
+        CREATE INDEX IF NOT EXISTS idx_concepts_file ON concepts(file_path);
+        CREATE INDEX IF NOT EXISTS idx_concepts_type ON concepts(type);
+        CREATE INDEX IF NOT EXISTS idx_concepts_project_type ON concepts(project_path, type);
+        CREATE INDEX IF NOT EXISTS idx_concepts_project_name ON concepts(project_path, name);
+      `,
+      down: `
+        -- Drop repository pattern tables
+        DROP TABLE IF EXISTS intelligence;
+        DROP TABLE IF EXISTS patterns;
+        DROP TABLE IF EXISTS concepts;
+
+        -- Drop optimized indexes
+        DROP INDEX IF EXISTS idx_developer_patterns_type_freq_conf;
+        DROP INDEX IF EXISTS idx_ai_insights_type_conf_created;
+        DROP INDEX IF EXISTS idx_feature_map_project_status;
+        DROP INDEX IF EXISTS idx_feature_map_project_name;
+        DROP INDEX IF EXISTS idx_work_sessions_active;
+        DROP INDEX IF EXISTS idx_project_decisions_made;
+
+        -- Drop repository table indexes
+        DROP INDEX IF EXISTS idx_intelligence_project;
+        DROP INDEX IF EXISTS idx_intelligence_status;
+        DROP INDEX IF EXISTS idx_patterns_project;
+        DROP INDEX IF EXISTS idx_patterns_type;
+        DROP INDEX IF EXISTS idx_patterns_project_type;
+        DROP INDEX IF EXISTS idx_patterns_project_confidence;
+        DROP INDEX IF EXISTS idx_concepts_project;
+        DROP INDEX IF EXISTS idx_concepts_file;
+        DROP INDEX IF EXISTS idx_concepts_type;
+        DROP INDEX IF EXISTS idx_concepts_project_type;
+        DROP INDEX IF EXISTS idx_concepts_project_name;
+      `
+    });
   }
 
   private loadMigrationFile(filename: string): string {
@@ -440,34 +564,36 @@ export class DatabaseMigrator {
     const currentVersion = this.getCurrentVersion();
     const targetVersion = this.getLatestVersion();
 
-    console.log(`Migrating database from version ${currentVersion} to ${targetVersion}`);
+    Logger.info('Migrating database', { fromVersion: currentVersion, toVersion: targetVersion });
 
     this.db.transaction(() => {
       for (const migration of this.migrations) {
         if (migration.version > currentVersion) {
-          console.log(`Applying migration ${migration.version}: ${migration.name}`);
-          
+          Logger.info('Applying migration', { version: migration.version, name: migration.name });
+
           try {
             // Execute the migration
             this.db.exec(migration.up);
-            
+
             // Validate migration success by checking data integrity
             this.validateMigration(migration);
-            
+
             // Record the migration
             this.db.prepare(`
               INSERT INTO migrations (version, name) VALUES (?, ?)
             `).run(migration.version, migration.name);
-            
-            console.log(`✅ Migration ${migration.version} applied and validated successfully`);
+
+            Logger.info('Migration applied and validated successfully', { version: migration.version });
           } catch (error) {
-            console.error(`❌ Migration ${migration.version} failed:`, error);
-            // Don't just log - provide recovery instructions
-            console.error(`\n🚨 MIGRATION FAILURE RECOVERY:`);
-            console.error(`   1. Database may be in inconsistent state`);
-            console.error(`   2. Check database backup before proceeding`);
-            console.error(`   3. Consider manual rollback: npm run db:rollback ${migration.version - 1}`);
-            console.error(`   4. Investigate root cause: ${error instanceof Error ? error.message : String(error)}`);
+            Logger.error('Migration failed', error instanceof Error ? error : new Error(String(error)), {
+              version: migration.version,
+              recoveryInstructions: [
+                'Database may be in inconsistent state',
+                'Check database backup before proceeding',
+                `Consider manual rollback: npm run db:rollback ${migration.version - 1}`,
+                `Investigate root cause: ${error instanceof Error ? error.message : String(error)}`
+              ]
+            });
             throw new Error(`Migration ${migration.version} failed: ${error instanceof Error ? error.message : String(error)}. Database integrity may be compromised.`);
           }
         }
@@ -476,7 +602,7 @@ export class DatabaseMigrator {
 
     // Final validation of entire migration process
     this.validateDatabaseIntegrity();
-    console.log('✅ All migrations completed and validated successfully');
+    Logger.info('All migrations completed and validated successfully');
   }
 
   /**
@@ -506,6 +632,20 @@ export class DatabaseMigrator {
           this.validateTableExists(['work_sessions', 'project_decisions']);
           this.validateIndexExists(['idx_work_sessions_project', 'idx_work_sessions_updated', 'idx_project_decisions_key']);
           break;
+        case 7: // UNIQUE constraint on project_metadata.project_path
+          // Validated by checking the table still exists after recreation
+          this.validateTableExists(['project_metadata']);
+          break;
+        case 8: // Schema reconciliation - repository tables and optimized indexes
+          this.validateTableExists(['intelligence', 'patterns', 'concepts']);
+          this.validateIndexExists([
+            'idx_intelligence_project',
+            'idx_patterns_project',
+            'idx_concepts_project',
+            'idx_developer_patterns_type_freq_conf',
+            'idx_feature_map_project_status'
+          ]);
+          break;
         default:
           // Generic validation - check migration was recorded
           break;
@@ -526,7 +666,9 @@ export class DatabaseMigrator {
         'architectural_decisions', 'shared_patterns', 'ai_insights',
         'project_metadata', 'migrations',
         'feature_map', 'entry_points', 'key_directories',
-        'work_sessions', 'project_decisions'
+        'work_sessions', 'project_decisions',
+        // Repository pattern tables (added in migration 8)
+        'intelligence', 'patterns', 'concepts'
       ];
 
       for (const table of requiredTables) {
@@ -536,14 +678,14 @@ export class DatabaseMigrator {
       // Check data consistency
       const conceptCount = this.db.prepare('SELECT COUNT(*) as count FROM semantic_concepts').get() as { count: number };
       const patternCount = this.db.prepare('SELECT COUNT(*) as count FROM developer_patterns').get() as { count: number };
-      
-      console.log(`📊 Database integrity check: ${conceptCount.count} concepts, ${patternCount.count} patterns`);
-      
+
+      Logger.info('Database integrity check', { conceptCount: conceptCount.count, patternCount: patternCount.count });
+
       // Validate no orphaned records (basic referential integrity)
       this.validateReferentialIntegrity();
-      
+
     } catch (error: unknown) {
-      console.error(`❌ Database integrity validation failed: ${error instanceof Error ? error.message : String(error)}`);
+      Logger.error('Database integrity validation failed', error instanceof Error ? error : new Error(String(error)));
       throw error;
     }
   }
@@ -625,11 +767,11 @@ export class DatabaseMigrator {
     const rollbackTo = targetVersion ?? currentVersion - 1;
 
     if (rollbackTo >= currentVersion) {
-      console.log('No rollback needed');
+      Logger.info('No rollback needed', { currentVersion, targetVersion: rollbackTo });
       return;
     }
 
-    console.log(`Rolling back database from version ${currentVersion} to ${rollbackTo}`);
+    Logger.info('Rolling back database', { fromVersion: currentVersion, toVersion: rollbackTo });
 
     this.db.transaction(() => {
       // Find migrations to rollback (in reverse order)
@@ -639,7 +781,7 @@ export class DatabaseMigrator {
 
       for (const migration of migrationsToRollback) {
         if (migration.down) {
-          console.log(`Rolling back migration ${migration.version}: ${migration.name}`);
+          Logger.info('Rolling back migration', { version: migration.version, name: migration.name });
 
           try {
             // Execute the rollback
@@ -650,50 +792,51 @@ export class DatabaseMigrator {
               DELETE FROM migrations WHERE version = ?
             `).run(migration.version);
 
-            console.log(`✅ Migration ${migration.version} rolled back successfully`);
+            Logger.info('Migration rolled back successfully', { version: migration.version });
           } catch (error) {
-            console.error(`❌ Rollback ${migration.version} failed:`, error);
+            Logger.error('Rollback failed', error instanceof Error ? error : new Error(String(error)), { version: migration.version });
             throw error;
           }
         } else {
-          console.warn(`⚠️ Migration ${migration.version} has no rollback script`);
+          Logger.warn('Migration has no rollback script', { version: migration.version });
           // When rolling back to version 0, we still need to delete the migration record
           // to maintain consistency, even though we can't undo the schema changes
           if (targetVersion === 0) {
             this.db.prepare(`
               DELETE FROM migrations WHERE version = ?
             `).run(migration.version);
-            console.log(`✅ Migration ${migration.version} record removed (no rollback script available)`);
+            Logger.info('Migration record removed (no rollback script available)', { version: migration.version });
           }
         }
       }
     })();
 
-    console.log('✅ Rollback completed successfully');
+    Logger.info('Rollback completed successfully');
   }
 
   status(): void {
     const currentVersion = this.getCurrentVersion();
     const latestVersion = this.getLatestVersion();
-    
-    console.log(`Database Status:`);
-    console.log(`  Current version: ${currentVersion}`);
-    console.log(`  Latest version: ${latestVersion}`);
-    console.log(`  Needs migration: ${this.needsMigration()}`);
-    
-    console.log(`\nApplied migrations:`);
+
     const appliedMigrations = this.db.prepare(`
       SELECT version, name, applied_at FROM migrations ORDER BY version
     `).all() as Array<{ version: number; name: string; applied_at: string }>;
-    
-    for (const migration of appliedMigrations) {
-      console.log(`  ✅ v${migration.version}: ${migration.name} (${migration.applied_at})`);
-    }
-    
-    console.log(`\nPending migrations:`);
+
     const pendingMigrations = this.migrations.filter(m => m.version > currentVersion);
-    for (const migration of pendingMigrations) {
-      console.log(`  ⏳ v${migration.version}: ${migration.name}`);
-    }
+
+    Logger.info('Database status', {
+      currentVersion,
+      latestVersion,
+      needsMigration: this.needsMigration(),
+      appliedMigrations: appliedMigrations.map(m => ({
+        version: m.version,
+        name: m.name,
+        appliedAt: m.applied_at
+      })),
+      pendingMigrations: pendingMigrations.map(m => ({
+        version: m.version,
+        name: m.name
+      }))
+    });
   }
 }

@@ -14,51 +14,48 @@ import * as LearningPipelineModule from '../services/learning-pipeline.js';
 describe('Learning Pipeline', () => {
   describe('Module exports', () => {
     it('should export the LearningPipelineModule', () => {
-      expect(LearningPipelineModule).toBeDefined();
+      expect(LearningPipelineModule).toMatchObject({
+        LearningPipeline: expect.any(Function),
+        LearningStage: expect.any(Object),
+        createLearningPipeline: expect.any(Function),
+      });
     });
 
     it('should export LearningPipeline class', () => {
-      expect(LearningPipelineModule.LearningPipeline).toBeDefined();
       expect(typeof LearningPipelineModule.LearningPipeline).toBe('function');
+      // Verify it's constructible
+      expect(LearningPipelineModule.LearningPipeline.prototype).toHaveProperty('execute');
     });
 
     it('should export LearningStage enum', () => {
-      expect(LearningPipelineModule.LearningStage).toBeDefined();
+      expect(LearningPipelineModule.LearningStage).toMatchObject({
+        Initialization: expect.any(String),
+        FileDiscovery: expect.any(String),
+        Parsing: expect.any(String),
+      });
     });
 
     it('should export createLearningPipeline function', () => {
-      expect(LearningPipelineModule.createLearningPipeline).toBeDefined();
       expect(typeof LearningPipelineModule.createLearningPipeline).toBe('function');
     });
   });
 
   describe('LearningStage enum', () => {
-    it('should have Initialization stage', () => {
-      expect(LearningPipelineModule.LearningStage.Initialization).toBeDefined();
-    });
+    it('should have all required stages with string values', () => {
+      const stages = LearningPipelineModule.LearningStage;
 
-    it('should have FileDiscovery stage', () => {
-      expect(LearningPipelineModule.LearningStage.FileDiscovery).toBeDefined();
-    });
+      expect(stages).toMatchObject({
+        Initialization: expect.any(String),
+        FileDiscovery: expect.any(String),
+        Parsing: expect.any(String),
+        ConceptExtraction: expect.any(String),
+        PatternDetection: expect.any(String),
+        Indexing: expect.any(String),
+        Completion: expect.any(String),
+      });
 
-    it('should have Parsing stage', () => {
-      expect(LearningPipelineModule.LearningStage.Parsing).toBeDefined();
-    });
-
-    it('should have ConceptExtraction stage', () => {
-      expect(LearningPipelineModule.LearningStage.ConceptExtraction).toBeDefined();
-    });
-
-    it('should have PatternDetection stage', () => {
-      expect(LearningPipelineModule.LearningStage.PatternDetection).toBeDefined();
-    });
-
-    it('should have Indexing stage', () => {
-      expect(LearningPipelineModule.LearningStage.Indexing).toBeDefined();
-    });
-
-    it('should have Completion stage', () => {
-      expect(LearningPipelineModule.LearningStage.Completion).toBeDefined();
+      // Verify stages have meaningful string values
+      expect(Object.values(stages)).toHaveLength(7);
     });
   });
 
@@ -81,7 +78,8 @@ describe('Learning Pipeline', () => {
     });
 
     it('should create pipeline with handlers', () => {
-      expect(pipeline).toBeDefined();
+      expect(pipeline).toBeInstanceOf(LearningPipelineModule.LearningPipeline);
+      expect(pipeline.getState()).toBe('idle');
     });
 
     it('should start in idle state', () => {

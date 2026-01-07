@@ -3,6 +3,7 @@ import { FileChange } from './file-watcher.js';
 import { SemanticEngine } from '../engines/semantic-engine.js';
 import { PatternEngine } from '../engines/pattern-engine.js';
 import { SQLiteDatabase } from '../storage/sqlite-db.js';
+import { Logger } from '../utils/logger.js';
 
 export interface ChangeAnalysis {
   change: FileChange;
@@ -362,7 +363,7 @@ export class ChangeAnalyzer extends EventEmitter {
       // Remove duplicates and return
       return [...new Set(dependentFiles)];
     } catch (error: unknown) {
-      console.warn('Could not find dependent files:', error instanceof Error ? error.message : String(error));
+      Logger.warn('Could not find dependent files', { error: error instanceof Error ? error.message : String(error), filePath });
       return [];
     }
   }

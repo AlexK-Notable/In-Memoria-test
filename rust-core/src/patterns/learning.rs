@@ -1,4 +1,18 @@
 //! Core learning algorithms for pattern discovery and analysis
+//!
+//! ## Thread Safety
+//!
+//! [`PatternLearningEngine`] is exposed to JavaScript via NAPI bindings. Thread safety
+//! is handled by NAPI's event loop serialization - all JavaScript calls to a single
+//! instance are processed sequentially.
+//!
+//! **Key points:**
+//! - Different instances are independent and can be used concurrently from JS
+//! - All methods use `&mut self` (exclusive mutable access)
+//! - Internal state (`learned_patterns`, sub-analyzers) is NOT protected by Mutex
+//! - Do NOT share instances across Worker threads
+//!
+//! See `docs/FFI_THREAD_SAFETY.md` for detailed documentation.
 
 #[cfg(feature = "napi-bindings")]
 use napi_derive::napi;
@@ -35,6 +49,18 @@ pub struct LearningMetrics {
     pub pattern_type_counts: HashMap<String, usize>,
     pub learning_accuracy: f64,
     pub last_learning_timestamp: Option<String>,
+}
+
+/// Statistics about the pattern learner's accumulated state
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "napi-bindings", napi(object))]
+pub struct LearnerStats {
+    /// Number of patterns currently stored
+    pub patterns_count: u32,
+    /// Total patterns learned across all sessions
+    pub total_patterns_learned: u32,
+    /// Current confidence threshold setting
+    pub confidence_threshold: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -387,6 +413,36 @@ impl PatternLearningEngine {
     /// Check if a pattern exists
     pub fn has_pattern(&self, id: &str) -> bool {
         self.learned_patterns.contains_key(id)
+    }
+
+    /// Clear all accumulated state to free memory
+    /// Call this between analysis sessions to prevent unbounded memory growth
+    #[cfg_attr(feature = "napi-bindings", napi)]
+    pub fn reset(&mut self) {
+        self.learned_patterns.clear();
+        self.learning_metrics = LearningMetrics {
+            total_patterns_learned: 0,
+            confidence_distribution: HashMap::new(),
+            pattern_type_counts: HashMap::new(),
+            learning_accuracy: 0.0,
+            last_learning_timestamp: None,
+        };
+        // Reset sub-analyzers
+        self.naming_analyzer = NamingPatternAnalyzer::new();
+        self.structural_analyzer = StructuralPatternAnalyzer::new();
+        self.implementation_analyzer = ImplementationPatternAnalyzer::new();
+        self.approach_predictor = ApproachPredictor::new();
+        // Preserve confidence_threshold as it's configuration, not accumulated state
+    }
+
+    /// Get current memory usage statistics for monitoring
+    #[cfg_attr(feature = "napi-bindings", napi)]
+    pub fn get_stats(&self) -> LearnerStats {
+        LearnerStats {
+            patterns_count: self.learned_patterns.len() as u32,
+            total_patterns_learned: self.learning_metrics.total_patterns_learned as u32,
+            confidence_threshold: self.confidence_threshold,
+        }
     }
 
     /// Updates patterns based on file changes (from original implementation)
@@ -2107,5 +2163,80 @@ class UserService {
 
         let result = engine.merge_similar_patterns(patterns);
         assert!(result.is_err(), "Should return error for empty pattern list");
+    }
+
+    #[test]
+    fn test_pattern_learning_engine_reset() {
+        let mut engine = PatternLearningEngine::new();
+
+        // Verify initial state
+        let initial_stats = engine.get_stats();
+        assert_eq!(initial_stats.patterns_count, 0);
+        assert_eq!(initial_stats.total_patterns_learned, 0);
+
+        // Add some patterns to accumulate state
+        let pattern = Pattern {
+            id: "test_pattern".to_string(),
+            pattern_type: "naming".to_string(),
+            description: "Test pattern".to_string(),
+            frequency: 5,
+            confidence: 0.8,
+            examples: vec![],
+            contexts: vec!["test".to_string()],
+        };
+        engine.insert_pattern("test_pattern".to_string(), pattern);
+
+        // Verify state was accumulated
+        let stats_before = engine.get_stats();
+        assert_eq!(stats_before.patterns_count, 1, "Should have 1 pattern");
+
+        // Reset the engine
+        engine.reset();
+
+        // Verify state was cleared
+        let stats_after = engine.get_stats();
+        assert_eq!(stats_after.patterns_count, 0, "Patterns should be cleared after reset");
+        assert_eq!(stats_after.total_patterns_learned, 0, "Total patterns learned should be reset");
+    }
+
+    #[test]
+    fn test_learner_stats_creation() {
+        let stats = LearnerStats {
+            patterns_count: 42,
+            total_patterns_learned: 100,
+            confidence_threshold: 0.75,
+        };
+
+        assert_eq!(stats.patterns_count, 42);
+        assert_eq!(stats.total_patterns_learned, 100);
+        assert_eq!(stats.confidence_threshold, 0.75);
+    }
+
+    #[test]
+    fn test_reset_preserves_configuration() {
+        let mut engine = PatternLearningEngine::new();
+
+        // Change configuration
+        engine.set_confidence_threshold(0.8);
+
+        // Add patterns
+        let pattern = Pattern {
+            id: "config_test".to_string(),
+            pattern_type: "structural".to_string(),
+            description: "Config test pattern".to_string(),
+            frequency: 3,
+            confidence: 0.9,
+            examples: vec![],
+            contexts: vec![],
+        };
+        engine.insert_pattern("config_test".to_string(), pattern);
+
+        // Reset
+        engine.reset();
+
+        // Verify configuration was preserved
+        let stats = engine.get_stats();
+        assert_eq!(stats.confidence_threshold, 0.8, "Confidence threshold should be preserved");
+        assert_eq!(stats.patterns_count, 0, "Patterns should be cleared");
     }
 }
